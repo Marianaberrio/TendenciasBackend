@@ -1066,15 +1066,17 @@ app.delete('/api/medicamentos/:id', async (req, res) => {
   }
 });
 
-// =========================
-// Recetas - PARTE 1
-// =========================
-const REC_TABLE = '[MedPresc].dbo.[Receta]';
-const PAC_TABLE = '[MedPresc].dbo.[Paciente]';
-const DOC_TABLE = '[MedPresc].dbo.[Doctor]';
-const RXITEM_TABLE = '[MedPresc].dbo.[medicamento_por_receta]';
 
-// Estados válidos según tu CHECK: ISSUED | DISPENSED | REVOKED
+
+// =========================
+// Recetas - PARTE 1 (incluye POST crear)
+// =========================
+const REC_TABLE     = '[MedPresc].dbo.[Receta]';
+const PAC_TABLE_R   = '[MedPresc].dbo.[Paciente]';   // nombres del paciente
+const DOC_TABLE_R   = '[MedPresc].dbo.[Doctor]';     // nombres del doctor
+const RXITEM_TABLE  = '[MedPresc].dbo.[medicamento_por_receta]';
+
+// Estados válidos según CHECK (ISSUED|DISPENSED|REVOKED)
 const ESTADOS_DB = new Set(['ISSUED','DISPENSED','REVOKED']);
 const ESTADO_MAP = {
   'emitida':'ISSUED','issued':'ISSUED',
@@ -1088,30 +1090,165 @@ function normalizeEstado(v){
   return mapped.toUpperCase();
 }
 
-// Util LIKE escape
-function likeEscape(s){ return String(s||'').replace(/[\\%_\[]/g, c => '\\'+c); }
+const crypto = require('crypto');
+function genCodigoReceta(){
+  const d = new Date();
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth()+1).padStart(2,'0');
+  const day = String(d.getUTCDate()).padStart(2,'0');
+  const rnd = crypto.randomBytes(3).toString('hex').toUpperCase(); // 6 hex
+  return `RX-${y}${m}${day}-${rnd}`;
+}
+function sha256Hex(s){ return crypto.createHash('sha256').update(s,'utf8').digest('hex'); }
 
-// === helper: trae items de la receta (si existen columnas mínimas) ===
+// Traer items (para /qr/:jti)
 async function fetchRecetaItems(p, codigoReceta){
   try{
     const q = await p.request().input('c', codigoReceta).query(`
-      SELECT * FROM ${RXITEM_TABLE} WHERE codigo_receta = @c ORDER BY 1;
+      SELECT codigo_medicamento, codigo_receta, nombre_medicamento, dosis_medicamento
+      FROM ${RXITEM_TABLE}
+      WHERE codigo_receta = @c
+      ORDER BY 1;
     `);
     return q.recordset || [];
-  }catch{
-    return []; // si no existe la tabla/permiso, devolvemos vacío
-  }
+  }catch{ return []; }
 }
 
-// 1) GET /api/recetas/codigo/:codigo
+/* =====================================================
+ * 0) POST /api/recetas  (crear receta + items opcional)
+ * Body mínimo: { id_paciente, codigo_doctor, created_by }
+ * Opcional: diagnostico, estado_receta, onchain_tx_create, chain_id,
+ *           channel_name, contract_name, qr_emitir, qr_ttl_hours,
+ *           items: [{ codigo_medicamento, nombre_medicamento?, dosis_medicamento? }]
+ * ===================================================== */
+app.post('/api/recetas', async (req, res) => {
+  const body = req.body || {};
+  try{
+    if (!body.id_paciente || !body.codigo_doctor || body.created_by == null){
+      return res.status(400).json({
+        error:'MISSING_FIELDS',
+        message:'id_paciente, codigo_doctor y created_by son requeridos'
+      });
+    }
+
+    const p = await getPool();
+    const tx = new sql.Transaction(p);
+    await tx.begin();
+
+    try{
+      const codigo_receta = body.codigo_receta || genCodigoReceta();
+      const fecha_receta  = body.fecha_receta ? new Date(body.fecha_receta) : new Date();
+      const estado_receta = normalizeEstado(body.estado_receta) || 'ISSUED';
+      if (!ESTADOS_DB.has(estado_receta)) throw new Error(`INVALID_ESTADO:${estado_receta}`);
+
+      // QR opcional
+      const qr_emitir = !!body.qr_emitir;
+      const ttlHours  = Number(body.qr_ttl_hours ?? 168);
+      const qr_jti    = qr_emitir ? (crypto.randomUUID ? crypto.randomUUID() : String(crypto.randomBytes(16).toString('hex'))) : null;
+      const qr_exp    = qr_emitir ? new Date(Date.now() + (isNaN(ttlHours)?168:ttlHours)*3600*1000) : null;
+
+      // Items limitados a columnas reales de medicamento_por_receta
+      const itemsLight = Array.isArray(body.items) ? body.items.map(it => ({
+        codigo_medicamento: it.codigo_medicamento ?? it.id_medicamento ?? null,
+        nombre_medicamento: it.nombre_medicamento ?? null,
+        dosis_medicamento:  it.dosis_medicamento  ?? null
+      })) : [];
+
+      // Hash inmutable (solo con campos relevantes)
+      const hashPayload = {
+        codigo_receta,
+        id_paciente: body.id_paciente,
+        codigo_doctor: body.codigo_doctor,
+        fecha_receta,
+        diagnostico: body.diagnostico || null,
+        items: itemsLight
+      };
+      const rx_hash = sha256Hex(JSON.stringify(hashPayload));
+
+      // INSERT Receta
+      const reqRec = new sql.Request(tx);
+      reqRec
+        .input('codigo_receta', sql.VarChar(40), codigo_receta)
+        .input('id_paciente', sql.Int, body.id_paciente)
+        .input('codigo_doctor', sql.Int, body.codigo_doctor)
+        .input('diagnostico', sql.NVarChar(500), body.diagnostico || null)
+        .input('fecha_receta', sql.DateTime2, fecha_receta)
+        .input('estado_receta', sql.VarChar(12), estado_receta)
+        .input('rx_hash', sql.Char(64), rx_hash)
+        .input('onchain_tx_create', sql.VarChar(128), body.onchain_tx_create || null)
+        .input('chain_id', sql.VarChar(32), body.chain_id || null)
+        .input('channel_name', sql.VarChar(64), body.channel_name || null)
+        .input('contract_name', sql.VarChar(64), body.contract_name || null)
+        .input('qr_jti', sql.Char(36), qr_jti)
+        .input('qr_exp', sql.DateTime2, qr_exp)
+        .input('qr_used', sql.Bit, 0)
+        .input('qr_used_ts', sql.DateTime2, null)
+        .input('qr_scanned_by_pharmacy_id', sql.Int, null)
+        .input('created_at', sql.DateTime2, new Date())
+        .input('created_by', sql.Int, body.created_by);
+
+      const insRec = await reqRec.query(`
+        INSERT INTO ${REC_TABLE}
+        (codigo_receta, id_paciente, codigo_doctor, diagnostico, fecha_receta, estado_receta,
+         rx_hash, onchain_tx_create, chain_id, channel_name, contract_name,
+         qr_jti, qr_exp, qr_used, qr_used_ts, qr_scanned_by_pharmacy_id,
+         created_at, created_by)
+        OUTPUT INSERTED.*
+        VALUES
+        (@codigo_receta, @id_paciente, @codigo_doctor, @diagnostico, @fecha_receta, @estado_receta,
+         @rx_hash, @onchain_tx_create, @chain_id, @channel_name, @contract_name,
+         @qr_jti, @qr_exp, @qr_used, @qr_used_ts, @qr_scanned_by_pharmacy_id,
+         @created_at, @created_by);
+      `);
+
+      const receta = insRec.recordset[0];
+
+      // INSERT de items
+      let itemsInsertados = [];
+      if (itemsLight.length){
+        for (const it of itemsLight){
+          if (it.codigo_medicamento == null) continue; // necesario
+          const reqIt = new sql.Request(tx);
+          reqIt
+            .input('codMed', sql.Int, it.codigo_medicamento)
+            .input('codRec', sql.VarChar(40), codigo_receta)
+            .input('nom',    sql.NVarChar(200), it.nombre_medicamento ?? null)
+            .input('dosis',  sql.NVarChar(100), it.dosis_medicamento  ?? null);
+          const insIt = await reqIt.query(`
+            INSERT INTO ${RXITEM_TABLE}
+              (codigo_medicamento, codigo_receta, nombre_medicamento, dosis_medicamento)
+            OUTPUT INSERTED.*
+            VALUES (@codMed, @codRec, @nom, @dosis);
+          `);
+          itemsInsertados.push(insIt.recordset[0]);
+        }
+      }
+
+      await tx.commit();
+      res.status(201).json({ ...receta, items: itemsInsertados });
+    }catch(e){
+      await tx.rollback();
+      if (String(e.message).startsWith('INVALID_ESTADO'))
+        return res.status(400).json({ error:'INVALID_ESTADO', allowed:[...ESTADOS_DB] });
+      throw e;
+    }
+  }catch(err){
+    console.error('POST /recetas', err);
+    res.status(500).json({ error:'DB_ERROR', message: err.message });
+  }
+});
+
+/* =====================================================
+ * 1) GET /api/recetas/codigo/:codigo
+ * ===================================================== */
 app.get('/api/recetas/codigo/:codigo', async (req,res)=>{
   try{
     const p = await getPool();
     const r = await p.request().input('codigo', req.params.codigo).query(`
       SELECT r.*, p.nombre_pac, p.apellido_pac, d.nombre_doc, d.apellido_doc
       FROM ${REC_TABLE} r
-      LEFT JOIN ${PAC_TABLE} p ON p.id_paciente = r.id_paciente
-      LEFT JOIN ${DOC_TABLE} d ON d.codigo_doctor = r.codigo_doctor
+      LEFT JOIN ${PAC_TABLE_R} p ON p.id_paciente = r.id_paciente
+      LEFT JOIN ${DOC_TABLE_R} d ON d.codigo_doctor = r.codigo_doctor
       WHERE r.codigo_receta = @codigo;
     `);
     if (!r.recordset.length) return res.status(404).json({ error:'NOT_FOUND' });
@@ -1122,15 +1259,17 @@ app.get('/api/recetas/codigo/:codigo', async (req,res)=>{
   }
 });
 
-// 2) GET /api/recetas/hash/:rx_hash
+/* =====================================================
+ * 2) GET /api/recetas/hash/:rx_hash
+ * ===================================================== */
 app.get('/api/recetas/hash/:rx_hash', async (req,res)=>{
   try{
     const p = await getPool();
     const r = await p.request().input('h', req.params.rx_hash).query(`
       SELECT r.*, p.nombre_pac, p.apellido_pac, d.nombre_doc, d.apellido_doc
       FROM ${REC_TABLE} r
-      LEFT JOIN ${PAC_TABLE} p ON p.id_paciente = r.id_paciente
-      LEFT JOIN ${DOC_TABLE} d ON d.codigo_doctor = r.codigo_doctor
+      LEFT JOIN ${PAC_TABLE_R} p ON p.id_paciente = r.id_paciente
+      LEFT JOIN ${DOC_TABLE_R} d ON d.codigo_doctor = r.codigo_doctor
       WHERE r.rx_hash = @h;
     `);
     if (!r.recordset.length) return res.status(404).json({ error:'NOT_FOUND' });
@@ -1141,15 +1280,17 @@ app.get('/api/recetas/hash/:rx_hash', async (req,res)=>{
   }
 });
 
-// 3) GET /api/recetas/qr/:jti  (validación rápida del QR)
+/* =====================================================
+ * 3) GET /api/recetas/qr/:jti  (validación rápida del QR)
+ * ===================================================== */
 app.get('/api/recetas/qr/:jti', async (req,res)=>{
   try{
     const p = await getPool();
     const r = await p.request().input('jti', req.params.jti).query(`
       SELECT r.*, p.nombre_pac, p.apellido_pac, d.nombre_doc, d.apellido_doc
       FROM ${REC_TABLE} r
-      LEFT JOIN ${PAC_TABLE} p ON p.id_paciente = r.id_paciente
-      LEFT JOIN ${DOC_TABLE} d ON d.codigo_doctor = r.codigo_doctor
+      LEFT JOIN ${PAC_TABLE_R} p ON p.id_paciente = r.id_paciente
+      LEFT JOIN ${DOC_TABLE_R} d ON d.codigo_doctor = r.codigo_doctor
       WHERE r.qr_jti = @jti;
     `);
     if (!r.recordset.length) return res.status(404).json({ error:'NOT_FOUND' });
@@ -1188,8 +1329,10 @@ app.get('/api/recetas/qr/:jti', async (req,res)=>{
   }
 });
 
-// 4) PUT /api/recetas/:id/dispensar
-// Body: { onchain_tx_dispense: "0x...", qr_scanned_by_pharmacy_id: 123 }
+/* =====================================================
+ * 4) PUT /api/recetas/:id/dispensar
+ * Body: { onchain_tx_dispense: "0x...", qr_scanned_by_pharmacy_id: 123 }
+ * ===================================================== */
 app.put('/api/recetas/:id/dispensar', async (req,res)=>{
   try{
     const { onchain_tx_dispense = null, qr_scanned_by_pharmacy_id = null } = req.body || {};
@@ -1225,7 +1368,9 @@ app.put('/api/recetas/:id/dispensar', async (req,res)=>{
   }
 });
 
-// 5) GET /api/pacientes/:id/recetas  (paginado + filtros)
+/* =====================================================
+ * 5) GET /api/pacientes/:id/recetas  (paginado + filtros)
+ * ===================================================== */
 app.get('/api/pacientes/:id/recetas', async (req,res)=>{
   try{
     const p = await getPool();
@@ -1262,7 +1407,9 @@ app.get('/api/pacientes/:id/recetas', async (req,res)=>{
   }
 });
 
-// 6) GET /api/doctores/:id/recetas  (paginado + filtros)
+/* =====================================================
+ * 6) GET /api/doctores/:id/recetas  (paginado + filtros)
+ * ===================================================== */
 app.get('/api/doctores/:id/recetas', async (req,res)=>{
   try{
     const p = await getPool();
@@ -1299,7 +1446,9 @@ app.get('/api/doctores/:id/recetas', async (req,res)=>{
   }
 });
 
-// 7) PUT /api/recetas/:id/estado  (ISSUED|DISPENSED|REVOKED)
+/* =====================================================
+ * 7) PUT /api/recetas/:id/estado  (ISSUED|DISPENSED|REVOKED)
+ * ===================================================== */
 app.put('/api/recetas/:id/estado', async (req,res)=>{
   try{
     const next = normalizeEstado(req.body?.estado);
@@ -1324,8 +1473,10 @@ app.put('/api/recetas/:id/estado', async (req,res)=>{
   }
 });
 
-// 8) POST /api/recetas/:id/qr/emitir  (solo si no tiene o override)
-// Body opcional: { ttl_hours: 168, override_if_exists: false }
+/* =====================================================
+ * 8) POST /api/recetas/:id/qr/emitir  (si no tiene QR o override)
+ * Body opcional: { ttl_hours: 168, override_if_exists: false }
+ * ===================================================== */
 app.post('/api/recetas/:id/qr/emitir', async (req,res)=>{
   try{
     const ttl = Number(req.body?.ttl_hours ?? 168);
@@ -1357,8 +1508,10 @@ app.post('/api/recetas/:id/qr/emitir', async (req,res)=>{
   }
 });
 
-// 9) POST /api/recetas/:id/qr/reemitir  (siempre genera uno nuevo)
-// Body opcional: { ttl_hours: 168 }
+/* =====================================================
+ * 9) POST /api/recetas/:id/qr/reemitir  (siempre genera uno nuevo)
+ * Body opcional: { ttl_hours: 168 }
+ * ===================================================== */
 app.post('/api/recetas/:id/qr/reemitir', async (req,res)=>{
   try{
     const ttl = Number(req.body?.ttl_hours ?? 168);
@@ -1384,8 +1537,10 @@ app.post('/api/recetas/:id/qr/reemitir', async (req,res)=>{
   }
 });
 
-// 10) PUT /api/recetas/:id/revocar  (bloquea si DISPENSED)
-// Body opcional: { onchain_tx_revoke: "0x..." }
+/* =====================================================
+ * 10) PUT /api/recetas/:id/revocar  (bloquea si DISPENSED)
+ * Body opcional: { onchain_tx_revoke: "0x..." }
+ * ===================================================== */
 app.put('/api/recetas/:id/revocar', async (req,res)=>{
   try{
     const { onchain_tx_revoke = null } = req.body || {};
@@ -1410,6 +1565,1066 @@ app.put('/api/recetas/:id/revocar', async (req,res)=>{
   }
 });
 
+// =========================
+// Recetas - Filtros & Listados + Consulta puntual
+// =========================
+
+// GET /api/recetas
+// Listado general con filtros: ?estado&paciente&doctor&desde&hasta&campo=fecha_receta|created_at&order=asc|desc&limit&offset
+app.get('/api/recetas', async (req, res) => {
+  try {
+    const p = await getPool();
+    const limit  = Math.min(parseInt(req.query.limit  || '50', 10), 200);
+    const offset = parseInt(req.query.offset || '0', 10);
+    const estado = normalizeEstado(req.query.estado) || null;
+    if (req.query.estado && !ESTADOS_DB.has(estado)) {
+      return res.status(400).json({ error: 'INVALID_ESTADO', allowed: [...ESTADOS_DB] });
+    }
+    const paciente = req.query.paciente ? parseInt(req.query.paciente, 10) : null;
+    const doctor   = req.query.doctor   ? parseInt(req.query.doctor,   10) : null;
+
+    const desde = (req.query.desde || '').trim() || null;
+    const hasta = (req.query.hasta || '').trim() || null;
+
+    const campoParam = String(req.query.campo || 'fecha_receta').toLowerCase();
+    const campoFecha = (campoParam === 'created_at') ? 'created_at' : 'fecha_receta';
+    const order = String(req.query.order || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    const r = await p.request()
+      .input('estado', estado)
+      .input('paciente', paciente)
+      .input('doctor', doctor)
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .input('offset', offset)
+      .input('limit', limit)
+      .query(`
+        SELECT *
+        FROM ${REC_TABLE}
+        WHERE 1=1
+          AND (@estado  IS NULL OR estado_receta  = @estado)
+          AND (@paciente IS NULL OR id_paciente   = @paciente)
+          AND (@doctor  IS NULL OR codigo_doctor  = @doctor)
+          AND (@desde   IS NULL OR ${campoFecha} >= @desde)
+          AND (@hasta   IS NULL OR ${campoFecha} < DATEADD(day, 1, @hasta))
+        ORDER BY ${campoFecha} ${order}, codigo_receta DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    res.json(r.recordset);
+  } catch (err) {
+    console.error('GET /api/recetas', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/recetas/estado/:estado
+// Lista por estado con paginado y ventana de fechas opcional (?desde&hasta&limit&offset)
+app.get('/api/recetas/estado/:estado', async (req, res) => {
+  try {
+    const p = await getPool();
+    const estado = normalizeEstado(req.params.estado);
+    if (!ESTADOS_DB.has(estado)) {
+      return res.status(400).json({ error: 'INVALID_ESTADO', allowed: [...ESTADOS_DB] });
+    }
+    const limit  = Math.min(parseInt(req.query.limit  || '50', 10), 200);
+    const offset = parseInt(req.query.offset || '0', 10);
+    const desde  = (req.query.desde || '').trim() || null;
+    const hasta  = (req.query.hasta || '').trim() || null;
+
+    const r = await p.request()
+      .input('estado', estado)
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .input('offset', offset)
+      .input('limit', limit)
+      .query(`
+        SELECT *
+        FROM ${REC_TABLE}
+        WHERE estado_receta = @estado
+          AND (@desde IS NULL OR fecha_receta >= @desde)
+          AND (@hasta IS NULL OR fecha_receta < DATEADD(day, 1, @hasta))
+        ORDER BY fecha_receta DESC, codigo_receta DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    res.json(r.recordset);
+  } catch (err) {
+    console.error('GET /api/recetas/estado/:estado', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/recetas/fecha
+// Filtro por ventana de tiempo (obligatorio al menos uno de: desde|hasta)
+// ?desde=YYYY-MM-DD&hasta=YYYY-MM-DD&campo=fecha_receta|created_at&limit&offset
+app.get('/api/recetas/fecha', async (req, res) => {
+  try {
+    const desde = (req.query.desde || '').trim() || null;
+    const hasta = (req.query.hasta || '').trim() || null;
+    if (!desde && !hasta) {
+      return res.status(400).json({ error: 'MISSING_RANGE', message: 'Envia desde y/o hasta.' });
+    }
+    const p = await getPool();
+    const limit  = Math.min(parseInt(req.query.limit  || '50', 10), 200);
+    const offset = parseInt(req.query.offset || '0', 10);
+
+    const campoParam = String(req.query.campo || 'fecha_receta').toLowerCase();
+    const campoFecha = (campoParam === 'created_at') ? 'created_at' : 'fecha_receta';
+
+    const r = await p.request()
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .input('offset', offset)
+      .input('limit', limit)
+      .query(`
+        SELECT *
+        FROM ${REC_TABLE}
+        WHERE (@desde IS NULL OR ${campoFecha} >= @desde)
+          AND (@hasta IS NULL OR ${campoFecha} < DATEADD(day, 1, @hasta))
+        ORDER BY ${campoFecha} DESC, codigo_receta DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    res.json(r.recordset);
+  } catch (err) {
+    console.error('GET /api/recetas/fecha', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/recetas/vencen
+// Próximas a expirar por qr_exp (por defecto 7 días). Solo recetas ISSUED y QR no usado.
+// ?dias=7&limit&offset
+app.get('/api/recetas/vencen', async (req, res) => {
+  try {
+    const p = await getPool();
+    const dias   = Math.max(1, Math.min(parseInt(req.query.dias || '7', 10), 90));
+    const limit  = Math.min(parseInt(req.query.limit  || '50', 10), 200);
+    const offset = parseInt(req.query.offset || '0', 10);
+
+    const r = await p.request()
+      .input('dias', dias)
+      .input('offset', offset)
+      .input('limit', limit)
+      .query(`
+        SELECT *
+        FROM ${REC_TABLE}
+        WHERE qr_exp IS NOT NULL
+          AND qr_exp >  SYSUTCDATETIME()
+          AND qr_exp <= DATEADD(day, @dias, SYSUTCDATETIME())
+          AND UPPER(estado_receta) = 'ISSUED'
+          AND (qr_used = 0 OR qr_used IS NULL)
+        ORDER BY qr_exp ASC, codigo_receta DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    res.json(r.recordset);
+  } catch (err) {
+    console.error('GET /api/recetas/vencen', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/recetas/exists
+// Chequeo rápido: ?codigo_receta=... | ?rx_hash=...  (al menos uno)
+// Respuesta: { exists: true/false }
+app.get('/api/recetas/exists', async (req, res) => {
+  try {
+    const codigo = (req.query.codigo_receta || '').trim() || null;
+    const hash   = (req.query.rx_hash       || '').trim() || null;
+    if (!codigo && !hash) {
+      return res.status(400).json({ error: 'MISSING_QUERY', message: 'Envia codigo_receta o rx_hash.' });
+    }
+    const p = await getPool();
+    const r = await p.request()
+      .input('codigo', codigo)
+      .input('hash', hash)
+      .query(`
+        SELECT TOP 1 1 AS ok
+        FROM ${REC_TABLE}
+        WHERE (@codigo IS NOT NULL AND codigo_receta = @codigo)
+           OR (@hash   IS NOT NULL AND rx_hash        = @hash);
+      `);
+    res.json({ exists: r.recordset.length > 0 });
+  } catch (err) {
+    console.error('GET /api/recetas/exists', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/recetas/:id   (detalle por codigo_receta)
+// ⚠️ Pon esta ruta **AL FINAL** del bloque de recetas, después de /estado, /fecha, /vencen, etc.
+app.get('/api/recetas/:id', async (req, res) => {
+  try {
+    const p = await getPool();
+    const r = await p.request().input('id', req.params.id).query(`
+      SELECT r.*, p.nombre_pac, p.apellido_pac, d.nombre_doc, d.apellido_doc
+      FROM ${REC_TABLE} r
+      LEFT JOIN [MedPresc].dbo.[Paciente] p ON p.id_paciente = r.id_paciente
+      LEFT JOIN [MedPresc].dbo.[Doctor]   d ON d.codigo_doctor = r.codigo_doctor
+      WHERE r.codigo_receta = @id;
+    `);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    const x = r.recordset[0];
+    const items = await fetchRecetaItems(p, x.codigo_receta);
+    res.json({ ...x, items });
+  } catch (err) {
+    console.error('GET /api/recetas/:id', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+
+
+//PROBAR
+
+// =========================
+// Recetas - TX On-chain / Auditoría / Items / Reportes
+// =========================
+//const REC_TABLE      = '[MedPresc].dbo.[Receta]';
+const ITEM_TABLE     = '[MedPresc].dbo.[medicamento_por_receta]';
+const DISP_TABLE     = '[MedPresc].dbo.[medicamento_dispensado]'; // tu tabla de la captura
+
+// ---- Helpers ----
+function txCol(tipo) {
+  const t = String(tipo || '').toLowerCase();
+  if (t === 'create')   return 'onchain_tx_create';
+  if (t === 'dispense') return 'onchain_tx_dispense';
+  if (t === 'revoke')   return 'onchain_tx_revoke';
+  return null;
+}
+function toBool(v){ return v === true || v === 1 || v === '1' || String(v).toLowerCase() === 'true'; }
+
+// ========================================
+// TX ON-CHAIN
+// ========================================
+
+// GET /api/recetas/:id/tx
+app.get('/api/recetas/:id/tx', async (req,res)=>{
+  try{
+    const p = await getPool();
+    const r = await p.request().input('id', req.params.id).query(`
+      SELECT codigo_receta, estado_receta,
+             onchain_tx_create, onchain_tx_dispense, onchain_tx_revoke,
+             chain_id, channel_name, contract_name
+      FROM ${REC_TABLE}
+      WHERE codigo_receta = @id;
+    `);
+    if (!r.recordset.length) return res.status(404).json({error:'NOT_FOUND'});
+    res.json(r.recordset[0]);
+  }catch(err){
+    console.error('GET /api/recetas/:id/tx', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// POST /api/onchain/callback
+// Body sugerido:
+// {
+//   "codigo_receta": "RX-...",
+//   "tipo": "create|dispense|revoke",
+//   "tx_hash": "0x...",
+//   "status": "confirmed|failed",
+//   "chain_id": "xxx", "channel_name": "xxx", "contract_name": "xxx",
+//   "qr_scanned_by_pharmacy_id": 101,   // opcional (dispense)
+//   "items": [                          // opcional: para registrar en medicamento_dispensado
+//     { "id_medicamento": 101, "nombre_medicamento": "Amoxicilina", "codigo_regulador": 1, "codigo_farmacia": 101, "actividad_sospechosa": false, "comentario": "OK" }
+//   ],
+//   "fecha_escaneado": "2025-09-01T12:00:00Z" // opcional
+// }
+app.post('/api/onchain/callback', async (req,res)=>{
+  const b = req.body || {};
+  try{
+    const tipo = txCol(b.tipo);
+    if (!b.codigo_receta || !tipo || !b.tx_hash){
+      return res.status(400).json({error:'MISSING_FIELDS', message:'codigo_receta, tipo(create|dispense|revoke) y tx_hash son requeridos.'});
+    }
+    const status = String(b.status||'').toLowerCase();
+
+    const p = await getPool();
+    const tx = new sql.Transaction(p);
+    await tx.begin();
+
+    try{
+      // actualizar columnas on-chain + chain metadata
+      const reqU = new sql.Request(tx);
+      reqU.input('id', b.codigo_receta)
+          .input('hash', b.tx_hash)
+          .input('chain', b.chain_id || null)
+          .input('chan',  b.channel_name || null)
+          .input('cn',    b.contract_name || null);
+
+      // base query y, si es confirmed, aplicar efectos
+      let q = `
+        UPDATE ${REC_TABLE}
+        SET ${tipo} = @hash,
+            chain_id = COALESCE(@chain, chain_id),
+            channel_name = COALESCE(@chan, channel_name),
+            contract_name = COALESCE(@cn, contract_name)
+      `;
+
+      if (status === 'confirmed') {
+        if (tipo === 'onchain_tx_dispense') {
+          q += `,
+            estado_receta = 'DISPENSED',
+            qr_used = 1,
+            qr_used_ts = COALESCE(qr_used_ts, SYSUTCDATETIME()),
+            qr_scanned_by_pharmacy_id = COALESCE(@ph, qr_scanned_by_pharmacy_id)
+          `;
+          reqU.input('ph', b.qr_scanned_by_pharmacy_id || null);
+        } else if (tipo === 'onchain_tx_revoke') {
+          q += `,
+            estado_receta = 'REVOKED'
+          `;
+        } // create: no cambia estado (permanece ISSUED)
+      }
+      q += ` OUTPUT INSERTED.* WHERE codigo_receta = @id;`;
+
+      const upd = await reqU.query(q);
+      if (!upd.recordset.length) throw new Error('NOT_FOUND');
+
+      // si vino listado de items para registrar en medicamento_dispensado
+      if (Array.isArray(b.items) && b.items.length){
+        const when = b.fecha_escaneado ? new Date(b.fecha_escaneado) : new Date();
+
+        for (const it of b.items){
+          const rq = new sql.Request(tx);
+          rq.input('idrec', sql.VarChar(40), b.codigo_receta)
+            .input('idmed', sql.Int, it.id_medicamento)
+            .input('nom',   sql.NVarChar(200), it.nombre_medicamento || null)
+            .input('reg',   sql.Int, it.codigo_regulador || null)
+            .input('far',   sql.Int, it.codigo_farmacia || null)
+            .input('fesc',  sql.DateTime2, when)
+            .input('susp',  sql.Bit, toBool(it.actividad_sospechosa) ? 1 : 0)
+            .input('comm',  sql.NVarChar(500), it.comentario || null);
+          await rq.query(`
+            INSERT INTO ${DISP_TABLE}
+              (id_receta, id_medicamento, nombre_medicamento, codigo_regulador, codigo_farmacia,
+               fecha_escaneado, actividad_sospechosa, comentario)
+            VALUES (@idrec, @idmed, @nom, @reg, @far, @fesc, @susp, @comm);
+          `);
+        }
+      }
+
+      await tx.commit();
+      res.status(200).json({ ok:true });
+    }catch(e){
+      await tx.rollback();
+      if (e.message === 'NOT_FOUND') return res.status(404).json({error:'NOT_FOUND'});
+      throw e;
+    }
+  }catch(err){
+    console.error('POST /api/onchain/callback', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// POST /api/recetas/:id/tx/retry?tipo=create|dispense|revoke
+// Marca el tx para reintento: limpia el hash correspondiente. No cambia el estado.
+app.post('/api/recetas/:id/tx/retry', async (req,res)=>{
+  try{
+    const col = txCol(req.query.tipo);
+    if (!col) return res.status(400).json({error:'INVALID_TIPO', allowed:['create','dispense','revoke']});
+
+    const p = await getPool();
+    const r = await p.request()
+      .input('id', req.params.id)
+      .query(`
+        UPDATE ${REC_TABLE}
+        SET ${col} = NULL
+        OUTPUT INSERTED.*
+        WHERE codigo_receta = @id;
+      `);
+    if (!r.recordset.length) return res.status(404).json({error:'NOT_FOUND'});
+    res.status(202).json({ ok:true, receta:r.recordset[0] });
+  }catch(err){
+    console.error('POST /api/recetas/:id/tx/retry', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// ========================================
+// AUDITORÍA (derivada) / MÉTRICAS
+// ========================================
+
+// GET /api/recetas/:id/auditoria
+// Construye un historial a partir de columnas de Receta + registros en medicamento_dispensado
+app.get('/api/recetas/:id/auditoria', async (req,res)=>{
+  try{
+    const p = await getPool();
+    const rec = await p.request().input('id', req.params.id).query(`
+      SELECT *
+      FROM ${REC_TABLE}
+      WHERE codigo_receta = @id;
+    `);
+    if (!rec.recordset.length) return res.status(404).json({error:'NOT_FOUND'});
+    const r = rec.recordset[0];
+
+    const disp = await p.request().input('id', req.params.id).query(`
+      SELECT *
+      FROM ${DISP_TABLE}
+      WHERE id_receta = @id
+      ORDER BY fecha_escaneado ASC, id_medicamento ASC;
+    `);
+
+    const events = [];
+    if (r.created_at) events.push({ type:'CREATED', ts:r.created_at, by:r.created_by ?? null });
+    if (r.qr_jti)     events.push({ type:'QR_EMITIDO', ts:r.qr_exp, jti:r.qr_jti, exp:r.qr_exp });
+    if (r.onchain_tx_create)   events.push({ type:'ONCHAIN_CREATE',   ts:r.created_at || null, tx:r.onchain_tx_create });
+    if (r.qr_used_ts || r.qr_used) events.push({ type:'QR_USADO', ts:r.qr_used_ts || null, by_pharmacy:r.qr_scanned_by_pharmacy_id || null });
+    if (r.onchain_tx_dispense) events.push({ type:'ONCHAIN_DISPENSE', ts:r.qr_used_ts || null, tx:r.onchain_tx_dispense });
+    if (r.onchain_tx_revoke)   events.push({ type:'ONCHAIN_REVOKE',   ts:null, tx:r.onchain_tx_revoke });
+    events.push({ type:'ESTADO_ACTUAL', ts:new Date(), estado:r.estado_receta });
+
+    for (const d of disp.recordset){
+      events.push({
+        type:'DISP_ITEM',
+        ts:d.fecha_escaneado,
+        item:{
+          id_medicamento:d.id_medicamento,
+          nombre_medicamento:d.nombre_medicamento,
+          codigo_farmacia:d.codigo_farmacia,
+          codigo_regulador:d.codigo_regulador,
+          actividad_sospechosa:d.actividad_sospechosa,
+          comentario:d.comentario
+        }
+      });
+    }
+
+    res.json({ codigo_receta:r.codigo_receta, events });
+  }catch(err){
+    console.error('GET /api/recetas/:id/auditoria', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// GET /api/recetas/count?estado&paciente&doctor&desde&hasta
+app.get('/api/recetas/count', async (req,res)=>{
+  try{
+    const p = await getPool();
+    const estado = req.query.estado ? normalizeEstado(req.query.estado) : null;
+    if (req.query.estado && !ESTADOS_DB.has(estado))
+      return res.status(400).json({error:'INVALID_ESTADO', allowed:[...ESTADOS_DB]});
+    const paciente = req.query.paciente ? parseInt(req.query.paciente,10) : null;
+    const doctor   = req.query.doctor   ? parseInt(req.query.doctor,10)   : null;
+    const desde    = (req.query.desde || '').trim() || null;
+    const hasta    = (req.query.hasta || '').trim() || null;
+
+    const r = await p.request()
+      .input('estado', estado)
+      .input('paciente', paciente)
+      .input('doctor', doctor)
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .query(`
+        SELECT COUNT(*) AS total
+        FROM ${REC_TABLE}
+        WHERE 1=1
+          AND (@estado  IS NULL OR estado_receta = @estado)
+          AND (@paciente IS NULL OR id_paciente  = @paciente)
+          AND (@doctor  IS NULL OR codigo_doctor = @doctor)
+          AND (@desde   IS NULL OR fecha_receta  >= @desde)
+          AND (@hasta   IS NULL OR fecha_receta  < DATEADD(day,1,@hasta));
+      `);
+
+    res.json({ total: r.recordset[0].total });
+  }catch(err){
+    console.error('GET /api/recetas/count', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// GET /api/reportes/recetas/resumen?desde&hasta&doctor&farmacia
+app.get('/api/reportes/recetas/resumen', async (req,res)=>{
+  try{
+    const p = await getPool();
+    const doctor   = req.query.doctor   ? parseInt(req.query.doctor,10)   : null;
+    const farmacia = req.query.farmacia ? parseInt(req.query.farmacia,10) : null;
+    const desde    = (req.query.desde || '').trim() || null;
+    const hasta    = (req.query.hasta || '').trim() || null;
+
+    // filtros base + filtro por farmacia via EXISTS en medicamento_dispensado
+    const existsFarm = farmacia ? `
+      AND EXISTS (
+        SELECT 1 FROM ${DISP_TABLE} d
+        WHERE d.id_receta = r.codigo_receta AND d.codigo_farmacia = @farmacia
+      )
+    ` : '';
+
+    // emitidas
+    const qEmit = await p.request()
+      .input('doctor', doctor).input('farmacia', farmacia)
+      .input('desde', desde).input('hasta', hasta)
+      .query(`
+        SELECT COUNT(*) AS c
+        FROM ${REC_TABLE} r
+        WHERE UPPER(r.estado_receta)='ISSUED'
+          AND (@doctor IS NULL OR r.codigo_doctor = @doctor)
+          AND (@desde  IS NULL OR r.fecha_receta >= @desde)
+          AND (@hasta  IS NULL OR r.fecha_receta < DATEADD(day,1,@hasta))
+          ${existsFarm};
+      `);
+
+    // dispensadas
+    const qDisp = await p.request()
+      .input('doctor', doctor).input('farmacia', farmacia)
+      .input('desde', desde).input('hasta', hasta)
+      .query(`
+        SELECT COUNT(*) AS c
+        FROM ${REC_TABLE} r
+        WHERE UPPER(r.estado_receta)='DISPENSED'
+          AND (@doctor IS NULL OR r.codigo_doctor = @doctor)
+          AND (@desde  IS NULL OR r.fecha_receta >= @desde)
+          AND (@hasta  IS NULL OR r.fecha_receta < DATEADD(day,1,@hasta))
+          ${existsFarm};
+      `);
+
+    // revocadas
+    const qRev = await p.request()
+      .input('doctor', doctor).input('farmacia', farmacia)
+      .input('desde', desde).input('hasta', hasta)
+      .query(`
+        SELECT COUNT(*) AS c
+        FROM ${REC_TABLE} r
+        WHERE UPPER(r.estado_receta)='REVOKED'
+          AND (@doctor IS NULL OR r.codigo_doctor = @doctor)
+          AND (@desde  IS NULL OR r.fecha_receta >= @desde)
+          AND (@hasta  IS NULL OR r.fecha_receta < DATEADD(day,1,@hasta))
+          ${existsFarm};
+      `);
+
+    // tiempo medio a dispensar (horas)
+    const qAvg = await p.request()
+      .input('doctor', doctor).input('farmacia', farmacia)
+      .input('desde', desde).input('hasta', hasta)
+      .query(`
+        SELECT AVG(CAST(DATEDIFF(second, r.fecha_receta, r.qr_used_ts) AS float)) AS avg_sec
+        FROM ${REC_TABLE} r
+        WHERE UPPER(r.estado_receta)='DISPENSED'
+          AND r.qr_used_ts IS NOT NULL
+          AND (@doctor IS NULL OR r.codigo_doctor = @doctor)
+          AND (@desde  IS NULL OR r.fecha_receta >= @desde)
+          AND (@hasta  IS NULL OR r.fecha_receta < DATEADD(day,1,@hasta))
+          ${existsFarm};
+      `);
+
+    const avgSec = qAvg.recordset[0].avg_sec;
+    res.json({
+      filtros: { desde, hasta, doctor, farmacia },
+      emitidas:   qEmit.recordset[0].c,
+      dispensadas:qDisp.recordset[0].c,
+      revocadas:  qRev.recordset[0].c,
+      tiempo_medio_dispensar_horas: avgSec != null ? (avgSec/3600) : null
+    });
+  }catch(err){
+    console.error('GET /api/reportes/recetas/resumen', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// ========================================
+// ITEMS (medicamento_por_receta) SUBRECURSO
+// ========================================
+
+// GET /api/recetas/:id/items
+app.get('/api/recetas/:id/items', async (req,res)=>{
+  try{
+    const p = await getPool();
+    const r = await p.request().input('id', req.params.id).query(`
+      SELECT codigo_medicamento, codigo_receta, nombre_medicamento, dosis_medicamento
+      FROM ${ITEM_TABLE}
+      WHERE codigo_receta = @id
+      ORDER BY codigo_medicamento ASC;
+    `);
+    res.json(r.recordset);
+  }catch(err){
+    console.error('GET /api/recetas/:id/items', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// POST /api/recetas/:id/items
+// Body: { codigo_medicamento, nombre_medicamento?, dosis_medicamento? }
+app.post('/api/recetas/:id/items', async (req,res)=>{
+  try{
+    const b = req.body || {};
+    if (b.codigo_medicamento == null)
+      return res.status(400).json({error:'MISSING_FIELDS', message:'codigo_medicamento es requerido.'});
+
+    const p = await getPool();
+    const r = await p.request()
+      .input('id',   req.params.id)
+      .input('cm',   b.codigo_medicamento)
+      .input('nom',  b.nombre_medicamento || null)
+      .input('dos',  b.dosis_medicamento  || null)
+      .query(`
+        INSERT INTO ${ITEM_TABLE}
+          (codigo_medicamento, codigo_receta, nombre_medicamento, dosis_medicamento)
+        OUTPUT INSERTED.*
+        VALUES (@cm, @id, @nom, @dos);
+      `);
+    res.status(201).json(r.recordset[0]);
+  }catch(err){
+    console.error('POST /api/recetas/:id/items', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// PATCH /api/recetas/:id/items/:codigo_medicamento
+// Body: { nombre_medicamento?, dosis_medicamento? }
+app.patch('/api/recetas/:id/items/:codigo_medicamento', async (req,res)=>{
+  try{
+    const b = req.body || {};
+    const sets = [];
+    if (b.nombre_medicamento !== undefined) sets.push('nombre_medicamento = @nom');
+    if (b.dosis_medicamento  !== undefined) sets.push('dosis_medicamento  = @dos');
+    if (!sets.length) return res.status(400).json({error:'EMPTY_BODY', message:'Nada que actualizar.'});
+
+    const p = await getPool();
+    const r = await p.request()
+      .input('id',  req.params.id)
+      .input('cm',  parseInt(req.params.codigo_medicamento,10))
+      .input('nom', b.nombre_medicamento ?? null)
+      .input('dos', b.dosis_medicamento  ?? null)
+      .query(`
+        UPDATE ${ITEM_TABLE}
+        SET ${sets.join(', ')}
+        OUTPUT INSERTED.*
+        WHERE codigo_receta = @id AND codigo_medicamento = @cm;
+      `);
+    if (!r.recordset.length) return res.status(404).json({error:'NOT_FOUND'});
+    res.json(r.recordset[0]);
+  }catch(err){
+    console.error('PATCH /api/recetas/:id/items/:codigo_medicamento', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// DELETE /api/recetas/:id/items/:codigo_medicamento
+app.delete('/api/recetas/:id/items/:codigo_medicamento', async (req,res)=>{
+  try{
+    const p = await getPool();
+    const r = await p.request()
+      .input('id', req.params.id)
+      .input('cm', parseInt(req.params.codigo_medicamento,10))
+      .query(`
+        DELETE FROM ${ITEM_TABLE}
+        OUTPUT DELETED.*
+        WHERE codigo_receta = @id AND codigo_medicamento = @cm;
+      `);
+    if (!r.recordset.length) return res.status(404).json({error:'NOT_FOUND'});
+    res.json({ ok:true, deleted:r.recordset[0] });
+  }catch(err){
+    console.error('DELETE /api/recetas/:id/items/:codigo_medicamento', err);
+    res.status(500).json({error:'DB_ERROR', message: err.message});
+  }
+});
+
+// ========================================
+// Adjuntos / Firma (placeholders 501)
+// ========================================
+
+app.post('/api/recetas/:id/adjuntos', (_req,res)=>{
+  res.status(501).json({ error:'NOT_IMPLEMENTED', message:'Integrar con Azure Blob + tabla receta_adjunto.' });
+});
+app.get('/api/recetas/:id/adjuntos', (_req,res)=>{
+  res.status(501).json({ error:'NOT_IMPLEMENTED', message:'Integrar con Azure Blob + tabla receta_adjunto.' });
+});
+app.post('/api/recetas/:id/firma', (_req,res)=>{
+  res.status(501).json({ error:'NOT_IMPLEMENTED', message:'Agregar almacenamiento de firma digital / hash de PDF.' });
+});
+app.get('/api/recetas/:id/firmada', (_req,res)=>{
+  res.status(501).json({ error:'NOT_IMPLEMENTED', message:'Requiere tabla o columnas para estado de firma.' });
+});
+
+
+
+// =========================
+// Dispensación - MVP + Opcionales
+// =========================
+const DISPENSA_TABLE = '[MedPresc].dbo.[Dispensacion]'; // cámbialo si tu tabla se llama distinto
+const RECETA_TABLE  = '[MedPresc].dbo.[Receta]';
+
+// Utiles
+function toBool(v){ return v === true || v === 1 || v === '1' || String(v).toLowerCase() === 'true'; }
+
+// ---------- MVP ----------
+
+// POST /api/dispensacion
+// Body: { codigo_receta, onchain_tx_dispense?, codigo_farmacia?, fecha_escaneado?, actividad_sospechosa?, comentario? }
+app.post('/api/dispensacion', async (req, res) => {
+  const b = req.body || {};
+  try {
+    if (!b.codigo_receta) {
+      return res.status(400).json({ error: 'MISSING_FIELDS', message: 'codigo_receta es requerido.' });
+    }
+    const p = await getPool();
+    const cur = await p.request().input('id', b.codigo_receta).query(`
+      SELECT codigo_receta, estado_receta, qr_used
+      FROM ${RECETA_TABLE}
+      WHERE codigo_receta = @id;
+    `);
+    if (!cur.recordset.length) return res.status(404).json({ error: 'NOT_FOUND', message: 'Receta no existe.' });
+
+    const R = cur.recordset[0];
+    if (String(R.estado_receta).toUpperCase() !== 'ISSUED' || R.qr_used) {
+      return res.status(409).json({ error: 'NO_APLICA', message: 'La receta no está ISSUED o ya fue usada.' });
+    }
+
+    const tx = new sql.Transaction(p);
+    await tx.begin();
+    try {
+      const when = b.fecha_escaneado ? new Date(b.fecha_escaneado) : new Date();
+
+      // 1) registrar dispensación
+      const ins = await new sql.Request(tx)
+        .input('cod',  sql.VarChar(40), b.codigo_receta)
+        .input('fesc', sql.DateTime2, when)
+        .input('susp', sql.Bit, toBool(b.actividad_sospechosa) ? 1 : 0)
+        .input('comm', sql.NVarChar(500), b.comentario ?? null)
+        .query(`
+          INSERT INTO ${DISP_TABLE}
+            (codigo_receta, fecha_escaneado, actividad_sospechosa, comentario)
+          OUTPUT INSERTED.*
+          VALUES (@cod, @fesc, @susp, @comm);
+        `);
+
+      // 2) marcar receta DISPENSED + QR usado + farmacia opcional
+      const up = await new sql.Request(tx)
+        .input('id', sql.VarChar(40), b.codigo_receta)
+        .input('tx', sql.VarChar(128), b.onchain_tx_dispense || null)
+        .input('ph', sql.Int, b.codigo_farmacia ?? null)
+        .query(`
+          UPDATE ${RECETA_TABLE}
+          SET estado_receta = 'DISPENSED',
+              onchain_tx_dispense = COALESCE(@tx, onchain_tx_dispense),
+              qr_used = 1,
+              qr_used_ts = SYSUTCDATETIME(),
+              qr_scanned_by_pharmacy_id = COALESCE(@ph, qr_scanned_by_pharmacy_id)
+          OUTPUT INSERTED.*
+          WHERE codigo_receta = @id;
+        `);
+
+      await tx.commit();
+      res.status(201).json({ dispensacion: ins.recordset[0], receta: up.recordset[0] });
+    } catch (e) {
+      await tx.rollback();
+      throw e;
+    }
+  } catch (err) {
+    console.error('POST /api/dispensacion', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/dispensacion
+// Filtros: ?receta=&farmacia=&sospechosa=&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&limit=50&offset=0&order=desc
+app.get('/api/dispensacion', async (req, res) => {
+  try {
+    const p = await getPool();
+    const limit  = Math.min(parseInt(req.query.limit  || '50', 10), 200);
+    const offset = parseInt(req.query.offset || '0', 10);
+    const receta = (req.query.receta || '').trim() || null;
+    const farm   = req.query.farmacia ? parseInt(req.query.farmacia, 10) : null; // via Receta.qr_scanned_by_pharmacy_id
+    const sospe  = (req.query.sospechosa ?? '').toString().toLowerCase();
+    const sospeFlag = (sospe === 'true' ? 1 : (sospe === 'false' ? 0 : null));
+    const desde  = (req.query.desde || '').trim() || null;
+    const hasta  = (req.query.hasta || '').trim() || null;
+    const order  = String(req.query.order || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+
+    const r = await p.request()
+      .input('rec', receta)
+      .input('farm', farm)
+      .input('susp', sospeFlag)
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .input('offset', offset)
+      .input('limit', limit)
+      .query(`
+        SELECT d.*, r.qr_scanned_by_pharmacy_id AS codigo_farmacia
+        FROM ${DISPENSA_TABLE} d
+        LEFT JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        WHERE 1=1
+          AND (@rec  IS NULL OR d.codigo_receta = @rec)
+          AND (@farm IS NULL OR r.qr_scanned_by_pharmacy_id = @farm)
+          AND (@susp IS NULL OR d.actividad_sospechosa = @susp)
+          AND (@desde IS NULL OR d.fecha_escaneado >= @desde)
+          AND (@hasta IS NULL OR d.fecha_escaneado < DATEADD(day, 1, @hasta))
+        ORDER BY d.fecha_escaneado ${order}, d.num_dispensacion DESC
+        OFFSET @offset ROWS FETCH NEXT @limit ROWS ONLY;
+      `);
+
+    res.json(r.recordset);
+  } catch (err) {
+    console.error('GET /api/dispensacion', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/dispensacion/:num  (detalle por PK)
+app.get('/api/dispensacion/:num', async (req, res) => {
+  try {
+    const p = await getPool();
+    const n = parseInt(req.params.num, 10);
+    const r = await p.request()
+      .input('num', isNaN(n) ? null : n)
+      .query(`
+        SELECT d.*, r.qr_scanned_by_pharmacy_id AS codigo_farmacia
+        FROM ${DISP_TABLE} d
+        LEFT JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        WHERE d.num_dispensacion = @num;
+      `);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json(r.recordset[0]);
+  } catch (err) {
+    console.error('GET /api/dispensacion/:num', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/recetas/:id/dispensacion  (historial por receta)
+app.get('/api/recetas/:id/dispensacion', async (req, res) => {
+  try {
+    const p = await getPool();
+    const r = await p.request()
+      .input('id', req.params.id)
+      .query(`
+        SELECT *
+        FROM ${DISPENSA_TABLE}
+        WHERE codigo_receta = @id
+        ORDER BY fecha_escaneado DESC, num_dispensacion DESC;
+      `);
+    res.json(r.recordset);
+  } catch (err) {
+    console.error('GET /api/recetas/:id/dispensacion', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// ---------- Opcionales recomendados ----------
+
+// POST /api/dispensacion/qr/:jti  (escaneo directo por QR)
+app.post('/api/dispensacion/qr/:jti', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const p = await getPool();
+    const cur = await p.request().input('jti', req.params.jti).query(`
+      SELECT *
+      FROM ${RECETA_TABLE}
+      WHERE qr_jti = @jti;
+    `);
+    if (!cur.recordset.length) return res.status(404).json({ error: 'NOT_FOUND', message: 'QR no encontrado' });
+
+    const x = cur.recordset[0];
+    const now = new Date();
+    const exp = x.qr_exp ? new Date(x.qr_exp) : null;
+    const razones = [];
+    if (!exp) razones.push('SIN_EXPIRACION');
+    if (exp && exp <= now) razones.push('QR_VENCIDO');
+    if (x.qr_used) razones.push('QR_USADO');
+    if (String(x.estado_receta).toUpperCase() !== 'ISSUED') razones.push('NO_ISSUED');
+    if (razones.length) return res.status(409).json({ error: 'QR_INVALIDO', razones });
+
+    const tx = new sql.Transaction(p);
+    await tx.begin();
+    try {
+      const when = b.fecha_escaneado ? new Date(b.fecha_escaneado) : new Date();
+      const ins = await new sql.Request(tx)
+        .input('cod',  sql.VarChar(40), x.codigo_receta)
+        .input('fesc', sql.DateTime2, when)
+        .input('susp', sql.Bit, toBool(b.actividad_sospechosa) ? 1 : 0)
+        .input('comm', sql.NVarChar(500), b.comentario ?? null)
+        .query(`
+          INSERT INTO ${DISPENSA_TABLE}
+            (codigo_receta, fecha_escaneado, actividad_sospechosa, comentario)
+          OUTPUT INSERTED.*
+          VALUES (@cod, @fesc, @susp, @comm);
+        `);
+
+      const up = await new sql.Request(tx)
+        .input('id', sql.VarChar(40), x.codigo_receta)
+        .input('tx', sql.VarChar(128), b.onchain_tx_dispense || null)
+        .input('ph', sql.Int, b.codigo_farmacia ?? null)
+        .query(`
+          UPDATE ${RECETA_TABLE}
+          SET estado_receta = 'DISPENSED',
+              onchain_tx_dispense = COALESCE(@tx, onchain_tx_dispense),
+              qr_used = 1,
+              qr_used_ts = SYSUTCDATETIME(),
+              qr_scanned_by_pharmacy_id = COALESCE(@ph, qr_scanned_by_pharmacy_id)
+          OUTPUT INSERTED.*
+          WHERE codigo_receta = @id;
+        `);
+
+      await tx.commit();
+      res.status(201).json({ dispensacion: ins.recordset[0], receta: up.recordset[0] });
+    } catch (e) {
+      await tx.rollback();
+      throw e;
+    }
+  } catch (err) {
+    console.error('POST /api/dispensacion/qr/:jti', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// PATCH /api/dispensacion/:num  (actualiza sospecha/comentario)
+app.patch('/api/dispensacion/:num', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sets = [];
+    if (b.actividad_sospechosa !== undefined) sets.push('actividad_sospechosa = @susp');
+    if (b.comentario !== undefined)           sets.push('comentario = @comm');
+    if (!sets.length) return res.status(400).json({ error:'EMPTY_BODY', message:'Nada que actualizar.' });
+
+    const p = await getPool();
+    const r = await p.request()
+      .input('num', parseInt(req.params.num,10))
+      .input('susp', b.actividad_sospechosa === undefined ? null : (toBool(b.actividad_sospechosa) ? 1 : 0))
+      .input('comm', b.comentario ?? null)
+      .query(`
+        UPDATE ${DISPENSA_TABLE}
+        SET ${sets.join(', ')}
+        OUTPUT INSERTED.*
+        WHERE num_dispensacion = @num;
+      `);
+    if (!r.recordset.length) return res.status(404).json({ error:'NOT_FOUND' });
+    res.json(r.recordset[0]);
+  } catch (err) {
+    console.error('PATCH /api/dispensacion/:num', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/dispensacion/count  (mismos filtros que listado)
+app.get('/api/dispensacion/count', async (req, res) => {
+  try {
+    const p = await getPool();
+    const receta = (req.query.receta || '').trim() || null;
+    const farm   = req.query.farmacia ? parseInt(req.query.farmacia, 10) : null;
+    const sospe  = (req.query.sospechosa ?? '').toString().toLowerCase();
+    const sospeFlag = (sospe === 'true' ? 1 : (sospe === 'false' ? 0 : null));
+    const desde  = (req.query.desde || '').trim() || null;
+    const hasta  = (req.query.hasta || '').trim() || null;
+
+    const r = await p.request()
+      .input('rec', receta)
+      .input('farm', farm)
+      .input('susp', sospeFlag)
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .query(`
+        SELECT COUNT(*) AS total
+        FROM ${DISPENSA_TABLE} d
+        LEFT JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        WHERE 1=1
+          AND (@rec  IS NULL OR d.codigo_receta = @rec)
+          AND (@farm IS NULL OR r.qr_scanned_by_pharmacy_id = @farm)
+          AND (@susp IS NULL OR d.actividad_sospechosa = @susp)
+          AND (@desde IS NULL OR d.fecha_escaneado >= @desde)
+          AND (@hasta IS NULL OR d.fecha_escaneado < DATEADD(day, 1, @hasta));
+      `);
+
+    res.json({ total: r.recordset[0].total });
+  } catch (err) {
+    console.error('GET /api/dispensacion/count', err);
+    res.status(500).json({ error:'DB_ERROR', message: err.message });
+  }
+});
+
+// GET /api/reportes/dispensacion/resumen?desde&hasta&farmacia&doctor
+app.get('/api/reportes/dispensacion/resumen', async (req, res) => {
+  try {
+    const p = await getPool();
+    const desde    = (req.query.desde || '').trim() || null;
+    const hasta    = (req.query.hasta || '').trim() || null;
+    const farmacia = req.query.farmacia ? parseInt(req.query.farmacia,10) : null;
+    const doctor   = req.query.doctor   ? parseInt(req.query.doctor,10)   : null;
+
+    const baseFilter = `
+      WHERE 1=1
+        ${desde ? 'AND d.fecha_escaneado >= @desde' : ''}
+        ${hasta ? 'AND d.fecha_escaneado < DATEADD(day,1,@hasta)' : ''}
+        ${farmacia ? 'AND r.qr_scanned_by_pharmacy_id = @farmacia' : ''}
+        ${doctor ? 'AND r.codigo_doctor = @doctor' : ''}
+    `;
+
+    // Totales
+    const tot = await p.request()
+      .input('desde', desde).input('hasta', hasta)
+      .input('farmacia', farmacia).input('doctor', doctor)
+      .query(`
+        SELECT
+          COUNT(*) AS total,
+          SUM(CASE WHEN d.actividad_sospechosa=1 THEN 1 ELSE 0 END) AS sospechosas
+        FROM ${DISPENSA_TABLE} d
+        JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        ${baseFilter};
+      `);
+
+    // Por farmacia
+    const porFarm = await p.request()
+      .input('desde', desde).input('hasta', hasta)
+      .input('farmacia', farmacia).input('doctor', doctor)
+      .query(`
+        SELECT r.qr_scanned_by_pharmacy_id AS farmacia,
+               COUNT(*) AS total,
+               SUM(CASE WHEN d.actividad_sospechosa=1 THEN 1 ELSE 0 END) AS sospechosas
+        FROM ${DISPENSA_TABLE} d
+        JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        ${baseFilter}
+        GROUP BY r.qr_scanned_by_pharmacy_id
+        ORDER BY total DESC;
+      `);
+
+    // Por doctor
+    const porDoc = await p.request()
+      .input('desde', desde).input('hasta', hasta)
+      .input('farmacia', farmacia).input('doctor', doctor)
+      .query(`
+        SELECT r.codigo_doctor AS doctor,
+               COUNT(*) AS total,
+               SUM(CASE WHEN d.actividad_sospechosa=1 THEN 1 ELSE 0 END) AS sospechosas
+        FROM ${DISPENSA_TABLE} d
+        JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        ${baseFilter}
+        GROUP BY r.codigo_doctor
+        ORDER BY total DESC;
+      `);
+
+    res.json({
+      filtros: { desde, hasta, farmacia, doctor },
+      total: tot.recordset[0]?.total ?? 0,
+      sospechosas: tot.recordset[0]?.sospechosas ?? 0,
+      por_farmacia: porFarm.recordset,
+      por_doctor: porDoc.recordset
+    });
+  } catch (err) {
+    console.error('GET /api/reportes/dispensacion/resumen', err);
+    res.status(500).json({ error:'DB_ERROR', message: err.message });
+  }
+});
+
+// DELETE /api/dispensacion/:num  (opcional, sin revert por defecto)
+app.delete('/api/dispensacion/:num', async (req, res) => {
+  try {
+    const p = await getPool();
+    const r = await p.request()
+      .input('num', parseInt(req.params.num,10))
+      .query(`
+        DELETE FROM ${DISPENSA_TABLE}
+        OUTPUT DELETED.*
+        WHERE num_dispensacion = @num;
+      `);
+    if (!r.recordset.length) return res.status(404).json({ error:'NOT_FOUND' });
+    res.json({ ok:true, deleted: r.recordset[0] });
+  } catch (err) {
+    console.error('DELETE /api/dispensacion/:num', err);
+    res.status(500).json({ error:'DB_ERROR', message: err.message });
+  }
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on port ${port}...`));
