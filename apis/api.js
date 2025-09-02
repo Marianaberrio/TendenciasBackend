@@ -1753,6 +1753,8 @@ app.get('/api/recetas/exists', async (req, res) => {
   }
 });
 
+
+
 // GET /api/recetas/:id   (detalle por codigo_receta)
 // ⚠️ Pon esta ruta **AL FINAL** del bloque de recetas, después de /estado, /fecha, /vencen, etc.
 app.get('/api/recetas/:id', async (req, res) => {
@@ -1778,7 +1780,7 @@ app.get('/api/recetas/:id', async (req, res) => {
 
 
 
-//PROBAR
+//PROBAR/////////////////////////////////////////////////////////////////////////
 
 // =========================
 // Recetas - TX On-chain / Auditoría / Items / Reportes
@@ -1800,6 +1802,8 @@ function toBool(v){ return v === true || v === 1 || v === '1' || String(v).toLow
 // ========================================
 // TX ON-CHAIN
 // ========================================
+
+
 
 // GET /api/recetas/:id/tx
 app.get('/api/recetas/:id/tx', async (req,res)=>{
@@ -1899,12 +1903,19 @@ app.post('/api/onchain/callback', async (req,res)=>{
             .input('fesc',  sql.DateTime2, when)
             .input('susp',  sql.Bit, toBool(it.actividad_sospechosa) ? 1 : 0)
             .input('comm',  sql.NVarChar(500), it.comentario || null);
-          await rq.query(`
+            await rq.query(`
+            IF NOT EXISTS (
+            SELECT 1
+            FROM ${DISP_TABLE}
+            WHERE id_receta = @idrec AND id_medicamento = @idmed
+            )
+            BEGIN
             INSERT INTO ${DISP_TABLE}
-              (id_receta, id_medicamento, nombre_medicamento, codigo_regulador, codigo_farmacia,
-               fecha_escaneado, actividad_sospechosa, comentario)
+            (id_receta, id_medicamento, nombre_medicamento, codigo_regulador, codigo_farmacia,
+            fecha_escaneado, actividad_sospechosa, comentario)
             VALUES (@idrec, @idmed, @nom, @reg, @far, @fesc, @susp, @comm);
-          `);
+            END
+            `);
         }
       }
 
@@ -2000,41 +2011,6 @@ app.get('/api/recetas/:id/auditoria', async (req,res)=>{
   }
 });
 
-// GET /api/recetas/count?estado&paciente&doctor&desde&hasta
-app.get('/api/recetas/count', async (req,res)=>{
-  try{
-    const p = await getPool();
-    const estado = req.query.estado ? normalizeEstado(req.query.estado) : null;
-    if (req.query.estado && !ESTADOS_DB.has(estado))
-      return res.status(400).json({error:'INVALID_ESTADO', allowed:[...ESTADOS_DB]});
-    const paciente = req.query.paciente ? parseInt(req.query.paciente,10) : null;
-    const doctor   = req.query.doctor   ? parseInt(req.query.doctor,10)   : null;
-    const desde    = (req.query.desde || '').trim() || null;
-    const hasta    = (req.query.hasta || '').trim() || null;
-
-    const r = await p.request()
-      .input('estado', estado)
-      .input('paciente', paciente)
-      .input('doctor', doctor)
-      .input('desde', desde)
-      .input('hasta', hasta)
-      .query(`
-        SELECT COUNT(*) AS total
-        FROM ${REC_TABLE}
-        WHERE 1=1
-          AND (@estado  IS NULL OR estado_receta = @estado)
-          AND (@paciente IS NULL OR id_paciente  = @paciente)
-          AND (@doctor  IS NULL OR codigo_doctor = @doctor)
-          AND (@desde   IS NULL OR fecha_receta  >= @desde)
-          AND (@hasta   IS NULL OR fecha_receta  < DATEADD(day,1,@hasta));
-      `);
-
-    res.json({ total: r.recordset[0].total });
-  }catch(err){
-    console.error('GET /api/recetas/count', err);
-    res.status(500).json({error:'DB_ERROR', message: err.message});
-  }
-});
 
 // GET /api/reportes/recetas/resumen?desde&hasta&doctor&farmacia
 app.get('/api/reportes/recetas/resumen', async (req,res)=>{
@@ -2128,20 +2104,50 @@ app.get('/api/reportes/recetas/resumen', async (req,res)=>{
 // ITEMS (medicamento_por_receta) SUBRECURSO
 // ========================================
 
-// GET /api/recetas/:id/items
-app.get('/api/recetas/:id/items', async (req,res)=>{
-  try{
+// POST /api/recetas/:id/items
+// Body: { codigo_medicamento, nombre_medicamento?, dosis_medicamento? }
+app.post('/api/recetas/:id/items', async (req, res) => {
+  try {
+    const b = req.body || {};
+    const cmInt = parseInt(b.codigo_medicamento, 10);
+    if (isNaN(cmInt)) {
+      return res.status(400).json({
+        error: 'MISSING_FIELDS',
+        message: 'codigo_medicamento es requerido y debe ser numérico.'
+      });
+    }
+
     const p = await getPool();
-    const r = await p.request().input('id', req.params.id).query(`
-      SELECT codigo_medicamento, codigo_receta, nombre_medicamento, dosis_medicamento
-      FROM ${ITEM_TABLE}
-      WHERE codigo_receta = @id
-      ORDER BY codigo_medicamento ASC;
-    `);
-    res.json(r.recordset);
-  }catch(err){
-    console.error('GET /api/recetas/:id/items', err);
-    res.status(500).json({error:'DB_ERROR', message: err.message});
+    const r = await p.request()
+      .input('id',  req.params.id)                    // codigo_receta
+      .input('cm',  cmInt)                            // codigo_medicamento
+      .input('nom', b.nombre_medicamento || null)
+      .input('dos', b.dosis_medicamento  || null)
+      .query(`
+        MERGE ${ITEM_TABLE} AS T
+        USING (
+          SELECT @id AS codigo_receta, @cm AS codigo_medicamento
+        ) AS S
+        ON (T.codigo_receta = S.codigo_receta AND T.codigo_medicamento = S.codigo_medicamento)
+        WHEN MATCHED THEN
+          UPDATE SET
+            nombre_medicamento = COALESCE(@nom, T.nombre_medicamento),
+            dosis_medicamento  = COALESCE(@dos, T.dosis_medicamento)
+        WHEN NOT MATCHED THEN
+          INSERT (codigo_medicamento, codigo_receta, nombre_medicamento, dosis_medicamento)
+          VALUES (@cm, @id, @nom, @dos)
+        OUTPUT $action AS accion, inserted.*;
+      `);
+
+    const row = r.recordset[0];
+    const accion = (row?.accion || '').toUpperCase(); // 'INSERT' | 'UPDATE'
+    const status = accion === 'INSERT' ? 201 : 200;
+    // quitamos 'accion' del payload de respuesta
+    if (row && 'accion' in row) delete row.accion;
+    return res.status(status).json(row || { ok: true });
+  } catch (err) {
+    console.error('POST /api/recetas/:id/items', err);
+    return res.status(500).json({ error: 'DB_ERROR', message: err.message });
   }
 });
 
@@ -2278,23 +2284,23 @@ app.post('/api/dispensacion', async (req, res) => {
     try {
       const when = b.fecha_escaneado ? new Date(b.fecha_escaneado) : new Date();
 
-      // 1) registrar dispensación
-      const ins = await new sql.Request(tx)
+      // 1) registrar dispensación (SOLO Dispensacion)
+        const ins = await new sql.Request(tx)
         .input('cod',  sql.VarChar(40), b.codigo_receta)
         .input('fesc', sql.DateTime2, when)
         .input('susp', sql.Bit, toBool(b.actividad_sospechosa) ? 1 : 0)
         .input('comm', sql.NVarChar(500), b.comentario ?? null)
         .query(`
-          INSERT INTO ${DISP_TABLE}
-            (codigo_receta, fecha_escaneado, actividad_sospechosa, comentario)
-          OUTPUT INSERTED.*
-          VALUES (@cod, @fesc, @susp, @comm);
-        `);
+        INSERT INTO ${DISPENSA_TABLE}
+        (codigo_receta, fecha_escaneado, actividad_sospechosa, comentario)
+        OUTPUT INSERTED.*
+       VALUES (@cod, @fesc, @susp, @comm);
+      `);
 
       // 2) marcar receta DISPENSED + QR usado + farmacia opcional
       const up = await new sql.Request(tx)
         .input('id', sql.VarChar(40), b.codigo_receta)
-        .input('tx', sql.VarChar(128), b.onchain_tx_dispense || null)
+        .input(' tx', sql.VarChar(128), b.onchain_tx_dispense || null)
         .input('ph', sql.Int, b.codigo_farmacia ?? null)
         .query(`
           UPDATE ${RECETA_TABLE}
@@ -2319,7 +2325,7 @@ app.post('/api/dispensacion', async (req, res) => {
   }
 });
 
-// GET /api/dispensacion
+// GET/api/dispensacion
 // Filtros: ?receta=&farmacia=&sospechosa=&desde=YYYY-MM-DD&hasta=YYYY-MM-DD&limit=50&offset=0&order=desc
 app.get('/api/dispensacion', async (req, res) => {
   try {
@@ -2363,19 +2369,58 @@ app.get('/api/dispensacion', async (req, res) => {
   }
 });
 
+// GET /api/dispensacion/count  (mismos filtros que listado)
+app.get('/api/dispensacion/count', async (req, res) => {
+  try {
+    const p = await getPool();
+    const receta = (req.query.receta || '').trim() || null;
+    const farm   = req.query.farmacia ? parseInt(req.query.farmacia, 10) : null;
+    const sospe  = (req.query.sospechosa ?? '').toString().toLowerCase();
+    const sospeFlag = (sospe === 'true' ? 1 : (sospe === 'false' ? 0 : null));
+    const desde  = (req.query.desde || '').trim() || null;
+    const hasta  = (req.query.hasta || '').trim() || null;
+
+    const r = await p.request()
+      .input('rec', receta)
+      .input('farm', farm)
+      .input('susp', sospeFlag)
+      .input('desde', desde)
+      .input('hasta', hasta)
+      .query(`
+        SELECT COUNT(*) AS total
+        FROM ${DISPENSA_TABLE} d
+        LEFT JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
+        WHERE 1=1
+          AND (@rec  IS NULL OR d.codigo_receta = @rec)
+          AND (@farm IS NULL OR r.qr_scanned_by_pharmacy_id = @farm)
+          AND (@susp IS NULL OR d.actividad_sospechosa = @susp)
+          AND (@desde IS NULL OR d.fecha_escaneado >= @desde)
+          AND (@hasta IS NULL OR d.fecha_escaneado < DATEADD(day, 1, @hasta));
+      `);
+
+    res.json({ total: r.recordset[0].total });
+  } catch (err) {
+    console.error('GET /api/dispensacion/count', err);
+    res.status(500).json({ error:'DB_ERROR', message: err.message });
+  }
+});
+
 // GET /api/dispensacion/:num  (detalle por PK)
 app.get('/api/dispensacion/:num', async (req, res) => {
   try {
     const p = await getPool();
     const n = parseInt(req.params.num, 10);
+
     const r = await p.request()
       .input('num', isNaN(n) ? null : n)
       .query(`
         SELECT d.*, r.qr_scanned_by_pharmacy_id AS codigo_farmacia
-        FROM ${DISP_TABLE} d
-        LEFT JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
-        WHERE d.num_dispensacion = @num;
+        FROM ${DISPENSA_TABLE} d           -- << aquí va Dispensacion
+        LEFT JOIN ${RECETA_TABLE} r
+          ON r.codigo_receta = d.codigo_receta
+        WHERE d.num_dispensacion = @num;   -- PK correcto
       `);
+
     if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
     res.json(r.recordset[0]);
   } catch (err) {
@@ -2383,6 +2428,8 @@ app.get('/api/dispensacion/:num', async (req, res) => {
     res.status(500).json({ error: 'DB_ERROR', message: err.message });
   }
 });
+
+
 
 // GET /api/recetas/:id/dispensacion  (historial por receta)
 app.get('/api/recetas/:id/dispensacion', async (req, res) => {
@@ -2470,6 +2517,8 @@ app.post('/api/dispensacion/qr/:jti', async (req, res) => {
   }
 });
 
+
+
 // PATCH /api/dispensacion/:num  (actualiza sospecha/comentario)
 app.patch('/api/dispensacion/:num', async (req, res) => {
   try {
@@ -2498,41 +2547,7 @@ app.patch('/api/dispensacion/:num', async (req, res) => {
   }
 });
 
-// GET /api/dispensacion/count  (mismos filtros que listado)
-app.get('/api/dispensacion/count', async (req, res) => {
-  try {
-    const p = await getPool();
-    const receta = (req.query.receta || '').trim() || null;
-    const farm   = req.query.farmacia ? parseInt(req.query.farmacia, 10) : null;
-    const sospe  = (req.query.sospechosa ?? '').toString().toLowerCase();
-    const sospeFlag = (sospe === 'true' ? 1 : (sospe === 'false' ? 0 : null));
-    const desde  = (req.query.desde || '').trim() || null;
-    const hasta  = (req.query.hasta || '').trim() || null;
 
-    const r = await p.request()
-      .input('rec', receta)
-      .input('farm', farm)
-      .input('susp', sospeFlag)
-      .input('desde', desde)
-      .input('hasta', hasta)
-      .query(`
-        SELECT COUNT(*) AS total
-        FROM ${DISPENSA_TABLE} d
-        LEFT JOIN ${RECETA_TABLE} r ON r.codigo_receta = d.codigo_receta
-        WHERE 1=1
-          AND (@rec  IS NULL OR d.codigo_receta = @rec)
-          AND (@farm IS NULL OR r.qr_scanned_by_pharmacy_id = @farm)
-          AND (@susp IS NULL OR d.actividad_sospechosa = @susp)
-          AND (@desde IS NULL OR d.fecha_escaneado >= @desde)
-          AND (@hasta IS NULL OR d.fecha_escaneado < DATEADD(day, 1, @hasta));
-      `);
-
-    res.json({ total: r.recordset[0].total });
-  } catch (err) {
-    console.error('GET /api/dispensacion/count', err);
-    res.status(500).json({ error:'DB_ERROR', message: err.message });
-  }
-});
 
 // GET /api/reportes/dispensacion/resumen?desde&hasta&farmacia&doctor
 app.get('/api/reportes/dispensacion/resumen', async (req, res) => {
