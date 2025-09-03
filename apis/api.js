@@ -2641,5 +2641,566 @@ app.delete('/api/dispensacion/:num', async (req, res) => {
   }
 });
 
+// ===================== CONFIGURACIÓN DIRECTA =====================
+const ACCESS_TOKEN_SECRET    = "tu_super_secreto_access";   // string secreto
+const REFRESH_TOKEN_SECRET   = "tu_super_secreto_refresh";  // string secreto
+const MFA_CHALLENGE_SECRET   = "tu_super_secreto_mfa";      // string secreto
+const ACCESS_TOKEN_TTL       = "15m";                       // string válido para JWT
+const REFRESH_TOKEN_TTL_DAYS = 15;                          // número de días
+const ADMIN_REGISTER_SECRET  = "superclave-pararegistrar";  // clave admin
+// =================================================================
+
+
+// ==== AUTH & MFA (agregar debajo de tus rutas, antes del app.listen) ====
+// ==== SHIMS sin dependencias externas (usa solo Node crypto) ====
+//const crypto = require('crypto');
+
+// ---------- Utils comunes ----------
+function parseDurationToSeconds(s) {
+  if (typeof s === 'number') return s;
+  const m = String(s).match(/^(\d+)\s*([smhd])?$/i);
+  if (!m) return 0;
+  const n = parseInt(m[1], 10);
+  const unit = (m[2] || 's').toLowerCase();
+  const mult = unit === 's' ? 1 : unit === 'm' ? 60 : unit === 'h' ? 3600 : 86400;
+  return n * mult;
+}
+function b64urlEncode(buf) {
+  return Buffer.from(buf).toString('base64').replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+}
+function b64urlDecode(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  const pad = 4 - (s.length % 4 || 4);
+  return Buffer.from(s + '='.repeat(pad), 'base64');
+}
+
+// ---------- JWT (HS256) ----------
+const jwt = {
+  sign(payload, secret, opts = {}) {
+    const header = { alg: 'HS256', typ: 'JWT' };
+    const iat = Math.floor(Date.now() / 1000);
+    const exp = opts.expiresIn ? iat + parseDurationToSeconds(opts.expiresIn) : undefined;
+    const body = { ...payload, iat, ...(exp ? { exp } : {}) };
+    const encHeader = b64urlEncode(JSON.stringify(header));
+    const encPayload = b64urlEncode(JSON.stringify(body));
+    const data = `${encHeader}.${encPayload}`;
+    const sig = crypto.createHmac('sha256', String(secret)).update(data).digest('base64')
+      .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+    return `${data}.${sig}`;
+  },
+  verify(token, secret) {
+    const [h, p, s] = String(token).split('.');
+    if (!h || !p || !s) throw new Error('JWT_MALFORMED');
+    const data = `${h}.${p}`;
+    const sig = crypto.createHmac('sha256', String(secret)).update(data).digest('base64')
+      .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+    // timing-safe compare
+    const ok = crypto.timingSafeEqual(Buffer.from(s), Buffer.from(sig));
+    if (!ok) throw new Error('JWT_BADSIG');
+    const payload = JSON.parse(b64urlDecode(p).toString('utf8'));
+    if (payload.exp && Math.floor(Date.now()/1000) >= payload.exp) throw new Error('JWT_EXPIRED');
+    return payload;
+  },
+  decode(token) {
+    const parts = String(token).split('.');
+    if (parts.length < 2) return null;
+    try { return JSON.parse(b64urlDecode(parts[1]).toString('utf8')); } catch { return null; }
+  }
+};
+
+// ---------- Password hashing (scrypt) ----------
+// ---------- Password hashing (scrypt) — PARCHE SEGURO DE MEMORIA ----------
+const SCRYPT_N  = 1 << 14; // 16384 (≈16 MB con r=8)
+const SCRYPT_R  = 8;
+const SCRYPT_P  = 1;
+function scryptOptsFor(N = SCRYPT_N) {
+  return { N, r: SCRYPT_R, p: SCRYPT_P, maxmem: 128 * N * SCRYPT_R + 1024 * 1024 };
+}
+
+const bcrypt = {
+  async hash(password, _cost = 12) {
+    // Usamos parámetros conservadores para no pasar el límite de memoria
+    const salt = crypto.randomBytes(16);
+    const opts = scryptOptsFor(SCRYPT_N);
+    const dk = await new Promise((res, rej) =>
+      crypto.scrypt(String(password), salt, 32, opts, (e, k) => e ? rej(e) : res(k))
+    );
+    // Formato: scrypt$N$saltHex$hashHex
+    return `scrypt$${SCRYPT_N}$${salt.toString('hex')}$${Buffer.from(dk).toString('hex')}`;
+  },
+
+  async compare(password, stored) {
+    try {
+      const [algo, Nstr, saltHex, hashHex] = String(stored).split('$');
+      if (algo !== 'scrypt') return false;
+      const N = parseInt(Nstr, 10);
+      const salt = Buffer.from(saltHex, 'hex');
+      const opts = scryptOptsFor(N); // usa el N almacenado
+      const dk = await new Promise((res, rej) =>
+        crypto.scrypt(String(password), salt, 32, opts, (e, k) => e ? rej(e) : res(k))
+      );
+      return crypto.timingSafeEqual(dk, Buffer.from(hashHex, 'hex'));
+    } catch {
+      return false;
+    }
+  }
+};
+
+
+// ---------- TOTP (RFC 6238) ----------
+function base32Encode(buf) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  let bits = 0, value = 0, out = '';
+  for (const byte of buf) {
+    value = (value << 8) | byte; bits += 8;
+    while (bits >= 5) { out += alphabet[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits > 0) out += alphabet[(value << (5 - bits)) & 31];
+  return out;
+}
+function base32Decode(str) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const map = Object.fromEntries(alphabet.split('').map((c,i)=>[c,i]));
+  let bits = 0, value = 0; const out = [];
+  str = String(str).replace(/=+$/,'').toUpperCase();
+  for (const ch of str) {
+    if (map[ch] === undefined) continue;
+    value = (value << 5) | map[ch]; bits += 5;
+    if (bits >= 8) { out.push((value >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return Buffer.from(out);
+}
+function hotp(secretBuf, counter, digits = 6) {
+  const c = Buffer.alloc(8);
+  for (let i = 0; i < 8; i++) c[7 - i] = counter & 0xff, counter >>= 8;
+  const h = crypto.createHmac('sha1', secretBuf).update(c).digest();
+  const offset = h[19] & 0xf;
+  const code = ((h[offset] & 0x7f) << 24) | ((h[offset+1] & 0xff) << 16) |
+               ((h[offset+2] & 0xff) << 8) | (h[offset+3] & 0xff);
+  const mod = 10 ** digits;
+  return String(code % mod).padStart(digits, '0');
+}
+const speakeasy = {
+  generateSecret({ length = 20, name = 'App' } = {}) {
+    const buf = crypto.randomBytes(length);
+    const base32 = base32Encode(buf);
+    const otpauth_url = `otpauth://totp/${encodeURIComponent(name)}?secret=${base32}&issuer=${encodeURIComponent('MedPresc')}`;
+    return { base32, otpauth_url };
+  },
+  totp: {
+    verify({ secret, encoding = 'base32', token, window = 1, step = 30 }) {
+      const secretBuf = encoding === 'base32' ? base32Decode(secret) : Buffer.from(secret, encoding);
+      const now = Math.floor(Date.now() / 1000);
+      const counter = Math.floor(now / step);
+      token = String(token).padStart(6, '0');
+      for (let w = -window; w <= window; w++) {
+        if (hotp(secretBuf, counter + w) === token) return true;
+      }
+      return false;
+    }
+  }
+};
+
+
+// Tablas auxiliares para refresh y reset (se crean si no existen)
+async function ensureAuthTables() {
+  const p = await getPool();
+  await p.request().query(`
+IF OBJECT_ID('dbo.RefreshToken','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.RefreshToken(
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    id_usuario INT NOT NULL,
+    token_hash NVARCHAR(255) NOT NULL,
+    jti UNIQUEIDENTIFIER NOT NULL DEFAULT NEWID(),
+    exp DATETIME2 NOT NULL,
+    revoked_at DATETIME2 NULL,
+    user_agent NVARCHAR(200) NULL,
+    ip NVARCHAR(64) NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+  CREATE INDEX IX_RefreshToken_user ON dbo.RefreshToken(id_usuario, exp);
+END;
+
+IF OBJECT_ID('dbo.PasswordReset','U') IS NULL
+BEGIN
+  CREATE TABLE dbo.PasswordReset(
+    id INT IDENTITY(1,1) PRIMARY KEY,
+    id_usuario INT NOT NULL,
+    reset_token_hash NVARCHAR(255) NOT NULL,
+    exp DATETIME2 NOT NULL,
+    used_at DATETIME2 NULL,
+    created_at DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+  );
+  CREATE INDEX IX_PasswordReset_user ON dbo.PasswordReset(id_usuario, exp);
+END;
+`);
+}
+ensureAuthTables().catch(e => console.error('ensureAuthTables', e));
+
+// Utils
+function sha256(s) { return require('crypto').createHash('sha256').update(String(s), 'utf8').digest('hex'); }
+function daysFromNow(days) { const d = new Date(); d.setUTCDate(d.getUTCDate()+days); return d; }
+function bearer(req) {
+  const h = req.headers.authorization || '';
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+function signAccess(u) {
+  return jwt.sign({
+    sub: u.id_usuario, usr: u.nombre_usuario,
+    mfa_enabled: !!u.mfa_enabled, mfa_method: u.mfa_primary_method || null
+  }, ACCESS_TOKEN_SECRET, { expiresIn: ACCESS_TOKEN_TTL });
+}
+async function issueRefresh(id_usuario, userAgent, ip) {
+  const token = jwt.sign({ sub: id_usuario }, REFRESH_TOKEN_SECRET, { expiresIn: `${REFRESH_TOKEN_TTL_DAYS}d` });
+  const decoded = jwt.decode(token);
+  const exp = new Date(decoded.exp * 1000);
+  const hash = sha256(token);
+  const p = await getPool();
+  await p.request()
+    .input('uid', id_usuario)
+    .input('h', hash)
+    .input('exp', exp)
+    .input('ua', userAgent || null)
+    .input('ip', ip || null)
+    .query(`
+      INSERT INTO dbo.RefreshToken(id_usuario, token_hash, exp, user_agent, ip)
+      VALUES (@uid, @h, @exp, @ua, @ip);
+    `);
+  return token;
+}
+async function revokeRefresh(token) {
+  if (!token) return;
+  const p = await getPool();
+  await p.request().input('h', sha256(token)).query(`
+    UPDATE dbo.RefreshToken SET revoked_at = SYSUTCDATETIME()
+    WHERE token_hash = @h AND revoked_at IS NULL;
+  `);
+}
+async function isRefreshValid(token) {
+  try {
+    const payload = jwt.verify(token, REFRESH_TOKEN_SECRET);
+    const p = await getPool();
+    const r = await p.request().input('h', sha256(token)).query(`
+      SELECT TOP 1 * FROM dbo.RefreshToken WHERE token_hash = @h AND revoked_at IS NULL AND exp > SYSUTCDATETIME();
+    `);
+    if (!r.recordset.length) return null;
+    return payload; // { sub, iat, exp }
+  } catch { return null; }
+}
+
+// Middleware auth por access token
+async function authRequired(req, res, next) {
+  try {
+    const token = bearer(req);
+    if (!token) return res.status(401).json({ error: 'NO_TOKEN' });
+    req.user = jwt.verify(token, ACCESS_TOKEN_SECRET);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'TOKEN_INVALID' });
+  }
+}
+
+// --------------------------- Autenticación ---------------------------
+
+// 1) POST /auth/register (protegido por ADMIN_REGISTER_SECRET simple)
+app.post('/auth/register', async (req, res) => {
+  try {
+    if ((req.headers['x-admin-secret'] || '') !== ADMIN_REGISTER_SECRET) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+    const { nombre_usuario, contrasena, email } = req.body || {};
+    if (!nombre_usuario || !contrasena) return res.status(400).json({ error: 'MISSING_FIELDS' });
+    const hash = await bcrypt.hash(contrasena, 12);
+    const p = await getPool();
+    const r = await p.request()
+      .input('u', nombre_usuario)
+      .input('h', hash)
+      .input('e', email || null)
+      .query(`
+        INSERT INTO dbo.Usuario(nombre_usuario, contrasena_hash, email)
+        OUTPUT INSERTED.id_usuario, INSERTED.nombre_usuario, INSERTED.email
+        VALUES (@u, @h, @e);
+      `);
+    res.status(201).json(r.recordset[0]);
+  } catch (err) {
+    if ((err.number === 2627 || err.number === 2601)) {
+      return res.status(409).json({ error: 'USERNAME_TAKEN' });
+    }
+    console.error('POST /auth/register', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 2) POST /auth/login (fase 1)
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { nombre_usuario, contrasena } = req.body || {};
+    if (!nombre_usuario || !contrasena) return res.status(400).json({ error: 'MISSING_FIELDS' });
+    const p = await getPool();
+    const r = await p.request().input('u', nombre_usuario).query(`SELECT TOP 1 * FROM dbo.Usuario WHERE nombre_usuario = @u;`);
+    if (!r.recordset.length) return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+    const u = r.recordset[0];
+
+    // Lockout simple
+    if (u.mfa_locked_until && new Date(u.mfa_locked_until) > new Date()) {
+      return res.status(423).json({ error: 'LOCKED', until: u.mfa_locked_until });
+    }
+
+    const ok = await bcrypt.compare(contrasena, u.contrasena_hash);
+    if (!ok) {
+      await p.request().input('id', u.id_usuario).query(`
+        UPDATE dbo.Usuario SET mfa_failed_count = mfa_failed_count + 1,
+          mfa_locked_until = CASE WHEN mfa_failed_count + 1 >= 5 THEN DATEADD(minute, 15, SYSUTCDATETIME()) ELSE mfa_locked_until END
+        WHERE id_usuario = @id;
+      `);
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
+    }
+
+    // reset contador
+    await p.request().input('id', u.id_usuario).query(`
+      UPDATE dbo.Usuario SET mfa_failed_count = 0, mfa_locked_until = NULL WHERE id_usuario = @id;
+    `);
+
+    if (u.mfa_enabled) {
+      const challenge = jwt.sign({ sub: u.id_usuario, purpose: 'mfa', usr: u.nombre_usuario }, MFA_CHALLENGE_SECRET, { expiresIn: '5m' });
+      return res.json({ need_mfa: true, login_challenge: challenge, methods: [u.mfa_primary_method || 'TOTP'] });
+    }
+
+    // Sin MFA: emitir tokens
+    const access = signAccess(u);
+    const refresh = await issueRefresh(u.id_usuario, req.headers['user-agent'], req.ip);
+    res.json({ need_mfa: false, access_token: access, refresh_token: refresh });
+  } catch (err) {
+    console.error('POST /auth/login', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+//Probé hasta aquí
+// 3) POST /auth/mfa/verify (fase 2)
+app.post('/auth/mfa/verify', async (req, res) => {
+  try {
+    const { login_challenge, code } = req.body || {};
+    if (!login_challenge || !code) return res.status(400).json({ error: 'MISSING_FIELDS' });
+    let payload;
+    try {
+      payload = jwt.verify(login_challenge, MFA_CHALLENGE_SECRET);
+    } catch {
+      return res.status(401).json({ error: 'CHALLENGE_INVALID' });
+    }
+    const p = await getPool();
+    const r = await p.request().input('id', payload.sub).query(`SELECT TOP 1 * FROM dbo.Usuario WHERE id_usuario = @id;`);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    const u = r.recordset[0];
+    if (!u.mfa_enabled) return res.status(409).json({ error: 'MFA_NOT_ENABLED' });
+
+    // Verificar TOTP con secreto guardado (VARBINARY -> base32 se guardó como binario de la cadena base32)
+    const secretBase32 = Buffer.isBuffer(u.mfa_totp_secret) ? Buffer.from(u.mfa_totp_secret).toString('utf8') : (u.mfa_totp_secret || '');
+    const verified = speakeasy.totp.verify({ secret: secretBase32, encoding: 'base32', token: String(code), window: 1 });
+    if (!verified) {
+      await p.request().input('id', u.id_usuario).query(`UPDATE dbo.Usuario SET mfa_failed_count = mfa_failed_count + 1 WHERE id_usuario = @id;`);
+      return res.status(401).json({ error: 'MFA_INVALID' });
+    }
+
+    // OK → emitir tokens y resetear contador
+    await p.request().input('id', u.id_usuario).query(`UPDATE dbo.Usuario SET mfa_failed_count = 0 WHERE id_usuario = @id;`);
+    const access = signAccess(u);
+    const refresh = await issueRefresh(u.id_usuario, req.headers['user-agent'], req.ip);
+    res.json({ access_token: access, refresh_token: refresh });
+  } catch (err) {
+    console.error('POST /auth/mfa/verify', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 4) POST /auth/refresh (rotativo)
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refresh_token } = req.body || {};
+    if (!refresh_token) return res.status(400).json({ error: 'MISSING_REFRESH' });
+    const payload = await isRefreshValid(refresh_token);
+    if (!payload) return res.status(401).json({ error: 'REFRESH_INVALID' });
+
+    // Rotar: revocar viejo y emitir nuevo
+    await revokeRefresh(refresh_token);
+
+    const p = await getPool();
+    const r = await p.request().input('id', payload.sub).query(`SELECT TOP 1 * FROM dbo.Usuario WHERE id_usuario = @id;`);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    const u = r.recordset[0];
+
+    const access = signAccess(u);
+    const refresh = await issueRefresh(u.id_usuario, req.headers['user-agent'], req.ip);
+    res.json({ access_token: access, refresh_token: refresh });
+  } catch (err) {
+    console.error('POST /auth/refresh', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 5) POST /auth/logout
+app.post('/auth/logout', async (req, res) => {
+  try {
+    const { refresh_token } = req.body || {};
+    if (refresh_token) await revokeRefresh(refresh_token);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /auth/logout', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 6) GET /auth/me
+app.get('/auth/me', authRequired, async (req, res) => {
+  try {
+    const p = await getPool();
+    const r = await p.request().input('id', req.user.sub).query(`
+      SELECT id_usuario, nombre_usuario, email, mfa_enabled, mfa_primary_method
+      FROM dbo.Usuario WHERE id_usuario = @id;
+    `);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json(r.recordset[0]);
+  } catch (err) {
+    console.error('GET /auth/me', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 7) POST /auth/mfa/setup (genera secreto TOTP provisional)  [requiere login]
+app.post('/auth/mfa/setup', authRequired, async (req, res) => {
+  try {
+    const secret = speakeasy.generateSecret({ length: 20, name: `MedPresc (${req.user.usr})` }); // .base32
+    const p = await getPool();
+    await p.request()
+      .input('id', req.user.sub)
+      .input('sec', Buffer.from(secret.base32, 'utf8'))
+      .query(`UPDATE dbo.Usuario SET mfa_totp_secret = @sec WHERE id_usuario = @id;`);
+    res.json({ otpauth_url: secret.otpauth_url, base32: secret.base32 });
+  } catch (err) {
+    console.error('POST /auth/mfa/setup', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 8) POST /auth/mfa/enable (confirma TOTP y habilita)
+app.post('/auth/mfa/enable', authRequired, async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code) return res.status(400).json({ error: 'MISSING_CODE' });
+    const p = await getPool();
+    const r = await p.request().input('id', req.user.sub).query(`SELECT TOP 1 * FROM dbo.Usuario WHERE id_usuario = @id;`);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    const u = r.recordset[0];
+    const secretBase32 = Buffer.isBuffer(u.mfa_totp_secret) ? Buffer.from(u.mfa_totp_secret).toString('utf8') : (u.mfa_totp_secret || '');
+    if (!secretBase32) return res.status(400).json({ error: 'NO_SECRET' });
+
+    const ok = speakeasy.totp.verify({ secret: secretBase32, encoding: 'base32', token: String(code), window: 1 });
+    if (!ok) return res.status(401).json({ error: 'MFA_INVALID' });
+
+    // (Opcional) generar recovery codes y guardar hashes JSON
+    const rec = Array.from({ length: 8 }, () => require('crypto').randomBytes(5).toString('hex'));
+    const recHashes = rec.map(x => sha256(x));
+    await p.request()
+      .input('id', req.user.sub)
+      .input('meth', 'TOTP')
+      .input('rec', JSON.stringify(recHashes))
+      .query(`
+        UPDATE dbo.Usuario
+        SET mfa_enabled = 1, mfa_primary_method = @meth, mfa_recovery_codes_hash = @rec
+        WHERE id_usuario = @id;
+      `);
+    res.json({ ok: true, recovery_codes: rec }); // <— muéstralos **una sola vez** al cliente
+  } catch (err) {
+    console.error('POST /auth/mfa/enable', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 9) POST /auth/password/forgot  (emite token de reset — dev: lo devuelve para probar)
+app.post('/auth/password/forgot', async (req, res) => {
+  try {
+    const { nombre_usuario } = req.body || {};
+    if (!nombre_usuario) return res.status(400).json({ error: 'MISSING_USER' });
+    const p = await getPool();
+    const r = await p.request().input('u', nombre_usuario).query(`SELECT TOP 1 id_usuario, email FROM dbo.Usuario WHERE nombre_usuario = @u;`);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    const u = r.recordset[0];
+
+    const raw = require('crypto').randomBytes(24).toString('hex');
+    const hash = sha256(raw);
+    const exp = daysFromNow(1); // 24h
+    await p.request().input('uid', u.id_usuario).input('h', hash).input('exp', exp).query(`
+      INSERT INTO dbo.PasswordReset(id_usuario, reset_token_hash, exp) VALUES (@uid, @h, @exp);
+    `);
+    // En producción: enviar por email. Para el reto: lo retornamos para tests.
+    res.json({ ok: true, reset_token_dev: raw, exp });
+  } catch (err) {
+    console.error('POST /auth/password/forgot', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 10) POST /auth/password/reset
+app.post('/auth/password/reset', async (req, res) => {
+  try {
+    const { nombre_usuario, reset_token, nueva_contrasena } = req.body || {};
+    if (!nombre_usuario || !reset_token || !nueva_contrasena) return res.status(400).json({ error: 'MISSING_FIELDS' });
+    const p = await getPool();
+    const u = await p.request().input('u', nombre_usuario).query(`SELECT TOP 1 id_usuario FROM dbo.Usuario WHERE nombre_usuario = @u;`);
+    if (!u.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    const uid = u.recordset[0].id_usuario;
+
+    const h = sha256(reset_token);
+    const t = await p.request().input('uid', uid).input('h', h).query(`
+      SELECT TOP 1 * FROM dbo.PasswordReset
+      WHERE id_usuario = @uid AND reset_token_hash = @h AND used_at IS NULL AND exp > SYSUTCDATETIME()
+      ORDER BY id DESC;
+    `);
+    if (!t.recordset.length) return res.status(400).json({ error: 'TOKEN_INVALID' });
+
+    const hash = await bcrypt.hash(nueva_contrasena, 12);
+    await p.request().input('uid', uid).input('h', hash).query(`
+      UPDATE dbo.Usuario SET contrasena_hash = @h WHERE id_usuario = @uid;
+    `);
+    await p.request().input('id', t.recordset[0].id).query(`UPDATE dbo.PasswordReset SET used_at = SYSUTCDATETIME() WHERE id = @id;`);
+
+    // Opcional: revocar refresh activos del usuario
+    await p.request().input('uid', uid).query(`
+      UPDATE dbo.RefreshToken SET revoked_at = SYSUTCDATETIME() WHERE id_usuario = @uid AND revoked_at IS NULL;
+    `);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('POST /auth/password/reset', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+// 11) DELETE /admin/users/:id  (borrar usuario) — protegido por X-Admin-Secret
+app.delete('/admin/users/:id', async (req, res) => {
+  try {
+    if ((req.headers['x-admin-secret'] || '') !== ADMIN_REGISTER_SECRET) {
+      return res.status(403).json({ error: 'FORBIDDEN' });
+    }
+    const p = await getPool();
+
+    // Revocar refresh tokens
+    await p.request().input('uid', parseInt(req.params.id,10)).query(`
+      UPDATE dbo.RefreshToken SET revoked_at = SYSUTCDATETIME() WHERE id_usuario = @uid AND revoked_at IS NULL;
+    `);
+
+    const r = await p.request().input('id', parseInt(req.params.id,10)).query(`
+      DELETE FROM dbo.Usuario OUTPUT DELETED.id_usuario, DELETED.nombre_usuario WHERE id_usuario = @id;
+    `);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+    res.json({ ok: true, deleted: r.recordset[0] });
+  } catch (err) {
+    console.error('DELETE /admin/users/:id', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
+
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on port ${port}...`));
