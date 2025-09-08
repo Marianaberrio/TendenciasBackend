@@ -3201,6 +3201,74 @@ app.delete('/admin/users/:id', async (req, res) => {
   }
 });
 
+//este lo probe y en teoria funciona, pero solo probe con el password, los codigos no se todavia pq si tengo que activar de nuevo el mfa me voy a eplota
+// 12) POST /auth/mfa/disable
+app.post('/auth/mfa/disable', authRequired, async (req, res) => {
+  try {
+    const { code, recovery_code, password } = req.body || {};
+    if (!code && !recovery_code && !password)
+      return res.status(400).json({ error: 'MISSING_VERIFICATION' });
+
+    const p = await getPool();
+    const r = await p.request().input('id', req.user.sub)
+      .query(`SELECT TOP 1 * FROM dbo.Usuario WHERE id_usuario = @id;`);
+    if (!r.recordset.length) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    const u = r.recordset[0];
+    if (!u.mfa_enabled) return res.status(409).json({ error: 'MFA_NOT_ENABLED' });
+
+    let verified = false, recoveryUsed = false;
+
+    if (!verified && password) {
+      try { if (await bcrypt.compare(String(password), u.contrasena_hash)) verified = true; } catch {}
+    }
+
+    if (!verified && code) {
+      const secretBase32 = Buffer.isBuffer(u.mfa_totp_secret)
+        ? Buffer.from(u.mfa_totp_secret).toString('utf8')
+        : (u.mfa_totp_secret || '');
+      if (secretBase32) {
+        const ok = speakeasy.totp.verify({
+          secret: secretBase32, encoding: 'base32', token: String(code), window: 1
+        });
+        if (ok) verified = true;
+      }
+    }
+
+    if (!verified && recovery_code) {
+      try {
+        const list = u.mfa_recovery_codes_hash ? JSON.parse(u.mfa_recovery_codes_hash) : [];
+        const rcHash = sha256(String(recovery_code).trim());
+        const idx = list.indexOf(rcHash);
+        if (idx !== -1) {
+          list.splice(idx, 1);
+          await p.request().input('id', u.id_usuario).input('rec', JSON.stringify(list))
+            .query(`UPDATE dbo.Usuario SET mfa_recovery_codes_hash = @rec WHERE id_usuario = @id;`);
+          verified = true; recoveryUsed = true;
+        }
+      } catch {}
+    }
+
+    if (!verified) return res.status(401).json({ error: 'VERIFY_FAILED' });
+
+    await p.request().input('id', u.id_usuario).query(`
+      UPDATE dbo.Usuario
+      SET mfa_enabled = 0,
+          mfa_primary_method = NULL,
+          mfa_totp_secret = NULL,
+          mfa_webauthn_credential = NULL,
+          mfa_recovery_codes_hash = NULL,
+          mfa_failed_count = 0,
+          mfa_locked_until = NULL
+      WHERE id_usuario = @id;
+    `);
+
+    res.json({ ok: true, recovery_code_used: recoveryUsed });
+  } catch (err) {
+    console.error('POST /auth/mfa/disable', err);
+    res.status(500).json({ error: 'DB_ERROR', message: err.message });
+  }
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on port ${port}...`));

@@ -1,0 +1,5 @@
+const crypto=require('crypto');
+function b32d(s){const A='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567',M=Object.fromEntries(A.split('').map((c,i)=>[c,i]));let bits=0,v=0,out=[];s=String(s).replace(/=+$/,'').toUpperCase();for(const ch of s){if(M[ch]===undefined)continue;v=(v<<5)|M[ch];bits+=5;if(bits>=8){out.push((v>>>(bits-8))&255);bits-=8;}}return Buffer.from(out);}
+function hotp(key,counter,d=6){const buf=Buffer.alloc(8);for(let i=7;i>=0;i--){buf[i]=counter&255;counter>>>=8;}const h=crypto.createHmac('sha1',key).update(buf).digest();const o=h[19]&15;const code=((h[o]&0x7f)<<24)|((h[o+1]&255)<<16)|((h[o+2]&255)<<8)|(h[o+3]&255);return String(code%10**d).padStart(d,'0');}
+function totp(base32,step=30){const ctr=Math.floor(Date.now()/1000/step);return hotp(b32d(base32),ctr);}
+console.log(totp(process.argv[2]));
