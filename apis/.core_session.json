@@ -1,0 +1,7 @@
+{
+  "base": "http://localhost:3000",
+  "user": "alice",
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsInVzciI6ImFsaWNlIiwibWZhX2VuYWJsZWQiOmZhbHNlLCJtZmFfbWV0aG9kIjpudWxsLCJpYXQiOjE3NTc1MzI4NjgsImV4cCI6MTc1NzUzMzc2OH0.scX6p9t3aSlGEYPxwhDGH2SuhFmDrRKSy6QmVbrKIVc",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsImlhdCI6MTc1NzUzMjg2OCwiZXhwIjoxNzU4ODI4ODY4fQ.RuNA64W9-tLUNQBXhMG14XxcRMSmbbb9LOQjb8pgReo",
+  "login_at": "2025-09-10T19:34:28.641Z"
+}

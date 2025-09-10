@@ -1,4 +1,3 @@
-// === api.js (reemplaza TODO) ===
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
@@ -3269,6 +3268,8 @@ app.post('/auth/mfa/disable', authRequired, async (req, res) => {
     res.status(500).json({ error: 'DB_ERROR', message: err.message });
   }
 });
+
+
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Listening on port ${port}...`));

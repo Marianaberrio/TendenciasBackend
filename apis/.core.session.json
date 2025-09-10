@@ -1,0 +1,7 @@
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsInVzciI6ImFsaWNlIiwibWZhX2VuYWJsZWQiOmZhbHNlLCJtZmFfbWV0aG9kIjpudWxsLCJpYXQiOjE3NTc1MzM3MzcsImV4cCI6MTc1NzUzNDYzN30.K5LvtFMJqtkSPsu3ByPBBE4Y1QbN43mREzJJ72cq1cA",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjEsImlhdCI6MTc1NzUzMzczNywiZXhwIjoxNzU4ODI5NzM3fQ.CBB7AWUZuvrWD6uK-bSm5SK4vw_IeTk6c_Dwu35qcl4",
+  "me": {
+    "nombre_usuario": "alice"
+  }
+}
