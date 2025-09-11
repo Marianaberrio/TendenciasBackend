@@ -17,6 +17,7 @@ const fs = require('fs');
 const path = require('path');
 const rl = require('readline');
 const os = require('os');
+const cp = require('child_process');
 
 const BASE = process.env.CORE_BASE || 'http://localhost:3000';
 const SESSION_FILE = path.join(__dirname, '.core.session.json');
@@ -74,6 +75,108 @@ function printTable(rows) {
   console.log(sep);
 }
 function toBool(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true'; }
+
+// ===================== helpers de entrada "bonitos" =====================
+async function askMode(label = 'cuerpo') {
+  console.log(`\n¿Cómo quieres ingresar el ${label}?`);
+  console.log('1) Llenar por campos (form)');
+  console.log('2) Pegar JSON');
+  console.log('3) Cargar desde archivo (@ruta.json)');
+  console.log('4) Abrir en editor con plantilla');
+  let m;
+  while (!['1','2','3','4'].includes(m = await prompt('Opción (1-4): '))) {}
+  return m;
+}
+function pick(obj, allowed) {
+  if (!Array.isArray(allowed) || allowed.length === 0) return obj;
+  const out = {};
+  for (const k of allowed) if (obj[k] !== undefined) out[k] = obj[k];
+  return out;
+}
+function safeParseJSON(t) {
+  try { return JSON.parse(t); } catch { return null; }
+}
+async function readJsonFromFileHint(hint) {
+  if (!hint || !hint.startsWith('@')) return null;
+  const p = hint.slice(1).trim();
+  try {
+    const txt = fs.readFileSync(path.resolve(p), 'utf8');
+    const j = safeParseJSON(txt);
+    if (!j) throw new Error('JSON inválido en archivo.');
+    return j;
+  } catch (e) {
+    console.error('❌', e.message);
+    return null;
+  }
+}
+async function openInEditorWithTemplate(templateObj) {
+  const tmp = path.join(os.tmpdir(), `corecli_${Date.now()}.json`);
+  fs.writeFileSync(tmp, JSON.stringify(templateObj, null, 2), 'utf8');
+  const editor = process.platform === 'win32' ? 'notepad' : (process.env.EDITOR || 'vi');
+  console.log(`\nAbriendo ${tmp} en ${editor}... (guarda y cierra para continuar)`);
+  try {
+    cp.spawnSync(editor, [tmp], { stdio: 'inherit' });
+  } catch {
+    console.log(`No pude abrir el editor automáticamente. Ábrelo manualmente: ${tmp}`);
+    await pressEnter();
+  }
+  const txt = fs.readFileSync(tmp, 'utf8');
+  const j = safeParseJSON(txt);
+  if (!j) throw new Error('El archivo guardado no es JSON válido.');
+  return j;
+}
+/**
+ * askBody: asistente genérico para construir cuerpos JSON
+ * @param {Object} opts
+ *  - label: texto para mostrar
+ *  - fields: [{key, label, required, parse}]  // para modo formulario
+ *  - template: objeto plantilla sugerida (se usa en editor)
+ *  - allowedKeys: restringe las claves que se envían (sanitiza)
+ */
+async function askBody(opts = {}) {
+  const { label = 'cuerpo', fields = [], template = {}, allowedKeys = [] } = opts;
+  const mode = await askMode(label);
+
+  if (mode === '1') {
+    // formulario
+    const out = {};
+    for (const f of fields) {
+      let v = await prompt(`${f.label || f.key}${f.required ? ' *' : ''}: `);
+      if ((v === '' || v == null) && f.required) {
+        console.log('Este campo es obligatorio.');
+        v = await prompt(`${f.label || f.key} *: `);
+      }
+      if (f.parse) {
+        try { v = f.parse(v); } catch { console.log('Valor inválido; dejo como texto.'); }
+      }
+      if (v !== '' && v != null) out[f.key] = v;
+    }
+    return pick(out, allowedKeys);
+  }
+
+  if (mode === '2') {
+    const raw = await prompt(`Pega JSON (una línea): `);
+    const j = safeParseJSON(raw);
+    if (!j) { console.log('JSON inválido.'); return await askBody(opts); }
+    return pick(j, allowedKeys);
+  }
+
+  if (mode === '3') {
+    const hint = await prompt('Ruta del archivo (empieza con @, ej: @C:\\data\\obj.json): ');
+    const j = await readJsonFromFileHint(hint);
+    if (!j) { console.log('No pude leer JSON del archivo.'); return await askBody(opts); }
+    return pick(j, allowedKeys);
+  }
+
+  // 4) Editor
+  try {
+    const j = await openInEditorWithTemplate(template);
+    return pick(j, allowedKeys);
+  } catch (e) {
+    console.error('❌', e.message);
+    return await askBody(opts);
+  }
+}
 
 // ===================== sesión =====================
 function loadSession() {
@@ -232,8 +335,38 @@ async function pacientesMenu() {
     const op = await prompt('\nOpción: ');
     try {
       if (op === '1') {
-        const bodyRaw = await prompt('JSON del paciente (ej: {"nombre_pac":"Ana","identificacion_pac":"V-123"}): ');
-        const body = JSON.parse(bodyRaw || '{}');
+        // DB: identificacion_pac (req), nombre_pac (req), apellido_pac (req),
+        // fecha_nac_pac (req), num_seguro_pac (opt), direccion_pac (opt),
+        // telefono_pac (opt), correo_pac (opt), sexo_pac (opt: O|F|M)
+        const body = await askBody({
+          label: 'paciente',
+          fields: [
+            { key: 'identificacion_pac', label: 'Cédula/identificación', required: true },
+            { key: 'nombre_pac', label: 'Nombre', required: true },
+            { key: 'apellido_pac', label: 'Apellido', required: true },
+            { key: 'fecha_nac_pac', label: 'Fecha de nacimiento (YYYY-MM-DD)', required: true },
+            { key: 'num_seguro_pac', label: 'Número de seguro' },
+            { key: 'direccion_pac', label: 'Dirección' },
+            { key: 'telefono_pac', label: 'Teléfono' },
+            { key: 'correo_pac', label: 'Correo' },
+            { key: 'sexo_pac', label: 'Sexo (M/F/O)' }
+          ],
+          template: {
+            identificacion_pac: "V-123",
+            nombre_pac: "Ana",
+            apellido_pac: "Pérez",
+            fecha_nac_pac: "1990-05-10",
+            num_seguro_pac: "S-0001",
+            direccion_pac: "Av. Principal #123",
+            telefono_pac: "809-000-0000",
+            correo_pac: "ana@example.com",
+            sexo_pac: "F"
+          },
+          allowedKeys: [
+            'identificacion_pac','nombre_pac','apellido_pac','fecha_nac_pac',
+            'num_seguro_pac','direccion_pac','telefono_pac','correo_pac','sexo_pac'
+          ]
+        });
         const r = await api('POST','/api/pacientes',body);
         console.log('Creado:', r);
         await pressEnter();
@@ -250,8 +383,29 @@ async function pacientesMenu() {
         await pressEnter();
       } else if (op === '4') {
         const id = await prompt('ID: ');
-        const bodyRaw = await prompt('JSON con campos a actualizar: ');
-        const body = JSON.parse(bodyRaw || '{}');
+        const body = await askBody({
+          label: 'actualización de paciente',
+          fields: [
+            { key: 'identificacion_pac', label: 'Cédula/identificación' },
+            { key: 'nombre_pac', label: 'Nombre' },
+            { key: 'apellido_pac', label: 'Apellido' },
+            { key: 'fecha_nac_pac', label: 'Fecha de nacimiento (YYYY-MM-DD)' },
+            { key: 'num_seguro_pac', label: 'Número de seguro' },
+            { key: 'direccion_pac', label: 'Dirección' },
+            { key: 'telefono_pac', label: 'Teléfono' },
+            { key: 'correo_pac', label: 'Correo' },
+            { key: 'sexo_pac', label: 'Sexo (M/F/O)' }
+          ],
+          template: {
+            identificacion_pac: "", nombre_pac: "", apellido_pac: "",
+            fecha_nac_pac: "", num_seguro_pac: "", direccion_pac: "",
+            telefono_pac: "", correo_pac: "", sexo_pac: ""
+          },
+          allowedKeys: [
+            'identificacion_pac','nombre_pac','apellido_pac','fecha_nac_pac',
+            'num_seguro_pac','direccion_pac','telefono_pac','correo_pac','sexo_pac'
+          ]
+        });
         const r = await api('PATCH', `/api/pacientes/${encodeURIComponent(id)}`, body);
         console.log(r);
         await pressEnter();
@@ -267,8 +421,28 @@ async function pacientesMenu() {
         await pressEnter();
       } else if (op === '7') {
         const ced = await prompt('Cédula: ');
-        const bodyRaw = await prompt('JSON con campos a actualizar: ');
-        const body = JSON.parse(bodyRaw || '{}');
+        const body = await askBody({
+          label: 'actualización de paciente por cédula',
+          fields: [
+            { key: 'nombre_pac', label: 'Nombre' },
+            { key: 'apellido_pac', label: 'Apellido' },
+            { key: 'fecha_nac_pac', label: 'Fecha de nacimiento (YYYY-MM-DD)' },
+            { key: 'num_seguro_pac', label: 'Número de seguro' },
+            { key: 'direccion_pac', label: 'Dirección' },
+            { key: 'telefono_pac', label: 'Teléfono' },
+            { key: 'correo_pac', label: 'Correo' },
+            { key: 'sexo_pac', label: 'Sexo (M/F/O)' }
+          ],
+          template: {
+            nombre_pac:"", apellido_pac:"", fecha_nac_pac:"",
+            num_seguro_pac:"", direccion_pac:"", telefono_pac:"",
+            correo_pac:"", sexo_pac:""
+          },
+          allowedKeys: [
+            'nombre_pac','apellido_pac','fecha_nac_pac',
+            'num_seguro_pac','direccion_pac','telefono_pac','correo_pac','sexo_pac'
+          ]
+        });
         const r = await api('PATCH', `/api/pacientes/cedula/${encodeURIComponent(ced)}`, body);
         console.log(r);
         await pressEnter();
@@ -302,8 +476,38 @@ async function doctoresMenu() {
     const op = await prompt('\nOpción: ');
     try {
       if (op === '1') {
-        const bodyRaw = await prompt('JSON del doctor (ej: {"num_licencia_med":"X1","cedula_doc":"V-999","nombre_doc":"Juan"}): ');
-        const body = JSON.parse(bodyRaw || '{}');
+        // DB: num_licencia_med (req), cedula_doc (req), nombre_doc (req),
+        // apellido_doc (req), fecha_nac_doc (req), sexo_doc (opt O|F|M),
+        // especialidad_doc (opt), telefono_doc (opt), correo_doc (opt)
+        const body = await askBody({
+          label: 'doctor',
+          fields: [
+            { key: 'num_licencia_med', label: 'N° Licencia', required: true },
+            { key: 'cedula_doc', label: 'Cédula', required: true },
+            { key: 'nombre_doc', label: 'Nombre', required: true },
+            { key: 'apellido_doc', label: 'Apellido', required: true },
+            { key: 'fecha_nac_doc', label: 'Fecha de nacimiento (YYYY-MM-DD)', required: true },
+            { key: 'sexo_doc', label: 'Sexo (M/F/O)' },
+            { key: 'especialidad_doc', label: 'Especialidad' },
+            { key: 'telefono_doc', label: 'Teléfono' },
+            { key: 'correo_doc', label: 'Correo' }
+          ],
+          template: {
+            num_licencia_med: "X1",
+            cedula_doc: "V-999",
+            nombre_doc: "Juan",
+            apellido_doc: "Pérez",
+            fecha_nac_doc: "1985-03-20",
+            sexo_doc: "M",
+            especialidad_doc: "Medicina General",
+            telefono_doc: "809-111-1111",
+            correo_doc: "juan@example.com"
+          },
+          allowedKeys: [
+            'num_licencia_med','cedula_doc','nombre_doc','apellido_doc',
+            'fecha_nac_doc','sexo_doc','especialidad_doc','telefono_doc','correo_doc'
+          ]
+        });
         const r = await api('POST','/api/doctores',body);
         console.log('Creado:', r);
         await pressEnter();
@@ -320,8 +524,28 @@ async function doctoresMenu() {
         await pressEnter();
       } else if (op === '4') {
         const id = await prompt('ID (codigo_doctor): ');
-        const bodyRaw = await prompt('JSON con campos a actualizar: ');
-        const body = JSON.parse(bodyRaw || '{}');
+        const body = await askBody({
+          label: 'actualización de doctor',
+          fields: [
+            { key: 'num_licencia_med', label: 'N° Licencia' },
+            { key: 'cedula_doc', label: 'Cédula' },
+            { key: 'nombre_doc', label: 'Nombre' },
+            { key: 'apellido_doc', label: 'Apellido' },
+            { key: 'fecha_nac_doc', label: 'Fecha de nacimiento (YYYY-MM-DD)' },
+            { key: 'sexo_doc', label: 'Sexo (M/F/O)' },
+            { key: 'especialidad_doc', label: 'Especialidad' },
+            { key: 'telefono_doc', label: 'Teléfono' },
+            { key: 'correo_doc', label: 'Correo' }
+          ],
+          template: {
+            num_licencia_med:"", cedula_doc:"", nombre_doc:"", apellido_doc:"",
+            fecha_nac_doc:"", sexo_doc:"", especialidad_doc:"", telefono_doc:"", correo_doc:""
+          },
+          allowedKeys: [
+            'num_licencia_med','cedula_doc','nombre_doc','apellido_doc',
+            'fecha_nac_doc','sexo_doc','especialidad_doc','telefono_doc','correo_doc'
+          ]
+        });
         const r = await api('PATCH', `/api/doctores/${encodeURIComponent(id)}`, body);
         console.log(r);
         await pressEnter();
@@ -337,8 +561,27 @@ async function doctoresMenu() {
         await pressEnter();
       } else if (op === '7') {
         const ced = await prompt('Cédula: ');
-        const bodyRaw = await prompt('JSON con campos a actualizar: ');
-        const body = JSON.parse(bodyRaw || '{}');
+        const body = await askBody({
+          label: 'actualización de doctor por cédula',
+          fields: [
+            { key: 'num_licencia_med', label: 'N° Licencia' },
+            { key: 'nombre_doc', label: 'Nombre' },
+            { key: 'apellido_doc', label: 'Apellido' },
+            { key: 'fecha_nac_doc', label: 'Fecha de nacimiento (YYYY-MM-DD)' },
+            { key: 'sexo_doc', label: 'Sexo (M/F/O)' },
+            { key: 'especialidad_doc', label: 'Especialidad' },
+            { key: 'telefono_doc', label: 'Teléfono' },
+            { key: 'correo_doc', label: 'Correo' }
+          ],
+          template: {
+            num_licencia_med:"", nombre_doc:"", apellido_doc:"",
+            fecha_nac_doc:"", sexo_doc:"", especialidad_doc:"", telefono_doc:"", correo_doc:""
+          },
+          allowedKeys: [
+            'num_licencia_med','nombre_doc','apellido_doc','fecha_nac_doc',
+            'sexo_doc','especialidad_doc','telefono_doc','correo_doc'
+          ]
+        });
         const r = await api('PATCH', `/api/doctores/cedula/${encodeURIComponent(ced)}`, body);
         console.log(r);
         await pressEnter();
@@ -376,9 +619,40 @@ async function recetasMenu() {
     const op = await prompt('\nOpción: ');
     try {
       if (op === '1') {
-        console.log('Campos mínimos: id_paciente, codigo_doctor, created_by.');
-        const bodyRaw = await prompt('JSON (ej: {"id_paciente":1,"codigo_doctor":1,"created_by":1,"diagnostico":"Dx","qr_emitir":true,"qr_ttl_hours":24,"items":[{"codigo_medicamento":101,"nombre_medicamento":"Amoxi","dosis_medicamento":"1 c/8h"}]}): ');
-        const body = JSON.parse(bodyRaw || '{}');
+        // DB requiere: id_paciente, codigo_doctor, created_by
+        // También existen: estado_receta (CHECK), rx_hash (NOT NULL) pero puede generarlo el backend.
+        const body = await askBody({
+          label: 'receta',
+          fields: [
+            { key: 'id_paciente', label: 'ID Paciente', required: true, parse: v => Number(v) },
+            { key: 'codigo_doctor', label: 'Código doctor', required: true, parse: v => Number(v) },
+            { key: 'created_by', label: 'User ID creador', required: true, parse: v => Number(v) },
+            { key: 'diagnostico', label: 'Diagnóstico' },
+            { key: 'estado_receta', label: 'Estado (ISSUED|DISPENSED|REVOKED) (def: ISSUED)' },
+            { key: 'rx_hash', label: 'rx_hash (64 hex) (opcional si lo genera el backend)' },
+            { key: 'qr_emitir', label: '¿Emitir QR? (true/false)', parse: v => toBool(v) },
+            { key: 'qr_ttl_hours', label: 'TTL QR (horas)', parse: v => v?Number(v):undefined }
+          ],
+          template: {
+            id_paciente: 1,
+            codigo_doctor: 1,
+            created_by: 1,
+            diagnostico: "Dx",
+            estado_receta: "ISSUED",
+            rx_hash: "",
+            qr_emitir: true,
+            qr_ttl_hours: 24,
+            items: [
+              { codigo_medicamento: 101, nombre_medicamento: "Amoxi", dosis_medicamento: "1 c/8h" }
+            ]
+          },
+          allowedKeys: [
+            'id_paciente','codigo_doctor','created_by','diagnostico',
+            'estado_receta','rx_hash','qr_emitir','qr_ttl_hours','items'
+          ]
+        });
+        // si no se proveyó estado, forzamos ISSUED por defecto
+        if (!body.estado_receta) body.estado_receta = 'ISSUED';
         const r = await api('POST','/api/recetas', body);
         console.log('Creada:', r);
         await pressEnter();
@@ -507,38 +781,70 @@ async function dispMenu() {
     const op = await prompt('\nOpción: ');
     try {
       if (op === '1') {
-        const bRaw = await prompt('JSON (ej: {"codigo_receta":"RX-...","codigo_farmacia":101,"onchain_tx_dispense":"0x...","fecha_escaneado":"2025-09-01T12:00:00Z","actividad_sospechosa":false,"comentario":"OK"}): ');
-        const b = JSON.parse(bRaw || '{}');
+        // Tabla Dispensacion: codigo_receta (req), fecha_escaneado (req, tiene default), actividad_sospechosa (req, default 0), comentario (opt)
+        const b = await askBody({
+          label: 'dispensación',
+          fields: [
+            { key: 'codigo_receta', label: 'Código receta (RX-...)', required: true },
+            { key: 'fecha_escaneado', label: 'Fecha ISO (YYYY-MM-DDTHH:mm:ssZ) (opcional si DB default)' },
+            { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
+            { key: 'comentario', label: 'Comentario' }
+          ],
+          template: {
+            codigo_receta: "RX-00001",
+            fecha_escaneado: "",
+            actividad_sospechosa: false,
+            comentario: "OK"
+          },
+          allowedKeys: ['codigo_receta','fecha_escaneado','actividad_sospechosa','comentario']
+        });
         const r = await api('POST','/api/dispensacion', b);
         console.log(r);
         await pressEnter();
       } else if (op === '2') {
         const jti = await prompt('QR jti: ');
-        const bRaw = await prompt('JSON (opcionales: {"codigo_farmacia":101,"onchain_tx_dispense":"0x...","actividad_sospechosa":false,"comentario":"OK","fecha_escaneado":"..."}): ');
-        const b = JSON.parse(bRaw || '{}');
+        const b = await askBody({
+          label: 'dispensación por QR',
+          fields: [
+            { key: 'fecha_escaneado', label: 'Fecha ISO (YYYY-MM-DDTHH:mm:ssZ) (opcional si DB default)' },
+            { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
+            { key: 'comentario', label: 'Comentario' }
+          ],
+          template: {
+            fecha_escaneado: "",
+            actividad_sospechosa: false,
+            comentario: "OK"
+          },
+          allowedKeys: ['fecha_escaneado','actividad_sospechosa','comentario']
+        });
         const r = await api('POST', `/api/dispensacion/qr/${encodeURIComponent(jti)}`, b);
         console.log(r);
         await pressEnter();
       } else if (op === '3') {
+        // filtros soportados por columnas de Dispensacion
         const receta = await prompt('codigo_receta (opcional): ');
-        const farmacia = await prompt('farmacia (opcional): ');
         const sospe = await prompt('sospechosa true|false (opcional): ');
         const desde = await prompt('desde YYYY-MM-DD (opcional): ');
         const hasta = await prompt('hasta YYYY-MM-DD (opcional): ');
         const limit = await prompt('limit (def 50): ');
         const offset = await prompt('offset (def 0): ');
         const order = await prompt('order asc|desc (def desc): ');
-        const q = `/api/dispensacion?receta=${encodeURIComponent(receta||'')}&farmacia=${encodeURIComponent(farmacia||'')}&sospechosa=${encodeURIComponent(sospe||'')}&desde=${encodeURIComponent(desde||'')}&hasta=${encodeURIComponent(hasta||'')}&limit=${encodeURIComponent(limit||'50')}&offset=${encodeURIComponent(offset||'0')}&order=${encodeURIComponent(order||'desc')}`;
+        const q = `/api/dispensacion?receta=${encodeURIComponent(receta||'')}`
+                + `&sospechosa=${encodeURIComponent(sospe||'')}`
+                + `&desde=${encodeURIComponent(desde||'')}&hasta=${encodeURIComponent(hasta||'')}`
+                + `&limit=${encodeURIComponent(limit||'50')}&offset=${encodeURIComponent(offset||'0')}`
+                + `&order=${encodeURIComponent(order||'desc')}`;
         const r = await api('GET', q);
         printTable(r);
         await pressEnter();
       } else if (op === '4') {
         const receta = await prompt('codigo_receta (opcional): ');
-        const farmacia = await prompt('farmacia (opcional): ');
         const sospe = await prompt('sospechosa true|false (opcional): ');
         const desde = await prompt('desde YYYY-MM-DD (opcional): ');
         const hasta = await prompt('hasta YYYY-MM-DD (opcional): ');
-        const q = `/api/dispensacion/count?receta=${encodeURIComponent(receta||'')}&farmacia=${encodeURIComponent(farmacia||'')}&sospechosa=${encodeURIComponent(sospe||'')}&desde=${encodeURIComponent(desde||'')}&hasta=${encodeURIComponent(hasta||'')}`;
+        const q = `/api/dispensacion/count?receta=${encodeURIComponent(receta||'')}`
+                + `&sospechosa=${encodeURIComponent(sospe||'')}`
+                + `&desde=${encodeURIComponent(desde||'')}&hasta=${encodeURIComponent(hasta||'')}`;
         const r = await api('GET', q);
         console.log(r);
         await pressEnter();
@@ -549,8 +855,15 @@ async function dispMenu() {
         await pressEnter();
       } else if (op === '6') {
         const num = await prompt('num_dispensacion: ');
-        const bRaw = await prompt('JSON (ej: {"actividad_sospechosa":true,"comentario":"Observación"}): ');
-        const b = JSON.parse(bRaw || '{}');
+        const b = await askBody({
+          label: 'patch de dispensación',
+          fields: [
+            { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
+            { key: 'comentario', label: 'Comentario' }
+          ],
+          template: { actividad_sospechosa: false, comentario: "" },
+          allowedKeys: ['actividad_sospechosa','comentario']
+        });
         const r = await api('PATCH', `/api/dispensacion/${encodeURIComponent(num)}`, b);
         console.log(r);
         await pressEnter();
