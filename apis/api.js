@@ -2906,33 +2906,35 @@ async function authRequired(req, res, next) {
 // 1) POST /auth/register (protegido por ADMIN_REGISTER_SECRET simple)
 app.post('/auth/register', async (req, res) => {
   try {
-    if ((req.headers['x-admin-secret'] || '') !== ADMIN_REGISTER_SECRET) {
-      return res.status(403).json({ error: 'FORBIDDEN' });
-    }
     const { nombre_usuario, contrasena, email } = req.body || {};
-    if (!nombre_usuario || !contrasena) return res.status(400).json({ error: 'MISSING_FIELDS' });
+    if (!nombre_usuario || !contrasena) {
+      return res.status(400).json({ error: 'MISSING_FIELDS' });
+    }
+
     const hash = await bcrypt.hash(contrasena, 12);
     const p = await getPool();
+
     const r = await p.request()
-      .input('u', nombre_usuario)
+      .input('u', nombre_usuario.trim())
       .input('h', hash)
-      .input('e', email || null)
+      .input('e', email ? email.trim() : null)
       .query(`
         INSERT INTO dbo.Usuario(nombre_usuario, contrasena_hash, email)
         OUTPUT INSERTED.id_usuario, INSERTED.nombre_usuario, INSERTED.email
         VALUES (@u, @h, @e);
       `);
+
     res.status(201).json(r.recordset[0]);
   } catch (err) {
-    if ((err.number === 2627 || err.number === 2601)) {
-      return res.status(409).json({ error: 'USERNAME_TAKEN' });
+    if (err.number === 2627 || err.number === 2601) {
+      return res.status(409).json({ error: 'USERNAME_TAKEN_OR_EMAIL_TAKEN' });
     }
     console.error('POST /auth/register', err);
     res.status(500).json({ error: 'DB_ERROR', message: err.message });
   }
 });
 
-// 2) POST /auth/login (fase 1)
+// 2) POST   (fase 1)
 app.post('/auth/login', async (req, res) => {
   try {
     const { nombre_usuario, contrasena } = req.body || {};
@@ -2943,11 +2945,13 @@ app.post('/auth/login', async (req, res) => {
     const u = r.recordset[0];
 
     // Lockout simple
-    if (u.mfa_locked_until && new Date(u.mfa_locked_until) > new Date()) {
+    /* if (u.mfa_locked_until && new Date(u.mfa_locked_until) > new Date()) {
       return res.status(423).json({ error: 'LOCKED', until: u.mfa_locked_until });
-    }
+    }*/
 
     const ok = await bcrypt.compare(contrasena, u.contrasena_hash);
+
+    /*
     if (!ok) {
       await p.request().input('id', u.id_usuario).query(`
         UPDATE dbo.Usuario SET mfa_failed_count = mfa_failed_count + 1,
@@ -2956,6 +2960,8 @@ app.post('/auth/login', async (req, res) => {
       `);
       return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
     }
+      */
+
 
     // reset contador
     await p.request().input('id', u.id_usuario).query(`

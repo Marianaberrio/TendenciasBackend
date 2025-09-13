@@ -238,11 +238,13 @@ async function tryRefresh() {
 
 // ===================== LOGIN / AUTENTICACIÓN =====================
 async function doLoginInteractive() {
-  const user = await prompt('Usuario: ');
-  const pass = await prompt('Contraseña: ', { mask: true });
+const user = await prompt('Usuario: ');
+  let pass = await prompt('Contraseña: ', { mask: true });
 
-  // fase 1
-  const r1 = await api('POST', '/auth/login', { nombre_usuario: user, contrasena: pass }, { auth:false });
+  // cinturón y tirantes: quita asteriscos (por si la TTY los inyecta) y espacios
+  pass = pass.replace(/\*/g, '').trim();
+
+  const r1 = await api('POST', '/auth/login', { nombre_usuario: user.trim(), contrasena: pass }, { auth:false });
   if (r1.need_mfa) {
     console.log('MFA requerido. Abre tu app TOTP.');
     const code = await prompt('Código TOTP: ');
@@ -255,62 +257,121 @@ async function doLoginInteractive() {
   }
 }
 
+async function doMfaDisableInteractive() {
+  console.log('\nVerificación para deshabilitar MFA: puedes usar contraseña, TOTP o recovery code.');
+  const modo = (await prompt('Usar (1) contraseña, (2) TOTP, (3) recovery code: ')).trim();
+  let body = {};
+  if (modo === '1') {
+    let pw = await prompt('Contraseña: ', { mask: true });
+    pw = pw.replace(/\*/g, '').trim();
+    body.password = pw;
+  } else if (modo === '2') {
+    body.code = await prompt('Código TOTP: ');
+  } else if (modo === '3') {
+    body.recovery_code = await prompt('Recovery code: ');
+  } else {
+    console.log('Modo inválido.');
+    return;
+  }
+  const r = await api('POST', '/auth/mfa/disable', body);
+  console.log(r);
+}
+
+async function doPasswordForgotInteractive() {
+  const u = await prompt('Nombre de usuario: ');
+  const r = await api('POST', '/auth/password/forgot', { nombre_usuario: u.trim() }, { auth:false });
+  console.log('Resultado:', r);
+  if (r && r.reset_token_dev) {
+    console.log('\n⚠️ Token DEV de reseteo (solo para pruebas):', r.reset_token_dev);
+  }
+}
+
+async function doPasswordResetInteractive() {
+  const u = await prompt('Nombre de usuario: ');
+  let newPw = await prompt('Nueva contraseña: ', { mask: true });
+  newPw = newPw.replace(/\*/g, '').trim();
+  const tok = await prompt('Reset token (enviado/DEV): ');
+  const r = await api('POST', '/auth/password/reset', {
+    nombre_usuario: u.trim(),
+    reset_token: tok.trim(),
+    nueva_contrasena: newPw
+  }, { auth:false });
+  console.log(r);
+}
+
+async function doRegisterInteractiveSimple() {
+  const u = await prompt('Nombre de usuario: ');
+  let pw = await prompt('Contraseña: ', { mask: true });
+  pw = pw.replace(/\*/g, '').trim(); // limpia asteriscos de la TTY
+  const email = await prompt('Email (opcional): ');
+
+  const body = {
+    nombre_usuario: u.trim(),
+    contrasena: pw,
+    email: (email || '').trim() || null
+  };
+
+  const r = await api('POST', '/auth/register', body, { auth: false });
+  console.log('✅ Usuario creado:', r);
+}
+
 async function authMenu() {
   while (true) {
     console.clear();
     console.log('=== AUTENTICACIÓN ===');
-    console.log('1) Login');
-    console.log('2) Ver /auth/me');
-    console.log('3) Logout (revocar refresh actual si lo pasas)');
-    console.log('4) Listar sesiones (/auth/sessions)');
-    console.log('5) Revocar una sesión por id (/auth/sessions/:id)');
-    console.log('6) Logout en todos los dispositivos (/auth/logout-all)');
-    console.log('7) MFA setup (/auth/mfa/setup)');
-    console.log('8) MFA enable (/auth/mfa/enable)');
+    console.log('1) Ver /auth/me');
+    console.log('2) Logout (revocar refresh actual si lo pasas)');
+    console.log('3) MFA setup (/auth/mfa/setup)');
+    console.log('4) MFA enable (/auth/mfa/enable)');
+    console.log('5) MFA disable (/auth/mfa/disable)');
+    console.log('6) Password forgot (/auth/password/forgot)');
+    console.log('7) Password reset (/auth/password/reset)');
+    console.log('8) Register (admin) (/auth/register)');
     console.log('0) Volver');
     const op = await prompt('\nOpción: ');
     try {
-      if (op === '1') { await doLoginInteractive(); await pressEnter(); }
-      else if (op === '2') { const me = await api('GET','/auth/me'); console.log(me); await pressEnter(); }
-      else if (op === '3') {
+      if (op === '1') {
+        const me = await api('GET','/auth/me');
+        console.log(me);
+        await pressEnter();
+      } else if (op === '2') {
         const s = loadSession();
-        if (!s.refresh_token) { console.log('No hay refresh_token guardado.'); }
-        else {
+        if (!s.refresh_token) {
+          console.log('No hay refresh_token guardado.');
+        } else {
           await api('POST','/auth/logout',{ refresh_token: s.refresh_token });
           clearSession();
           console.log('Sesión cerrada.');
         }
         await pressEnter();
-      }
-      else if (op === '4') {
-        const rows = await api('GET','/auth/sessions');
-        printTable(rows);
-        await pressEnter();
-      }
-      else if (op === '5') {
-        const id = await prompt('ID de sesión a revocar: ');
-        const res = await api('DELETE', `/auth/sessions/${encodeURIComponent(id)}`);
-        console.log(res);
-        await pressEnter();
-      }
-      else if (op === '6') {
-        const res = await api('POST','/auth/logout-all',{});
-        console.log(res);
-        await pressEnter();
-      }
-      else if (op === '7') {
+      } else if (op === '3') {
         const j = await api('POST','/auth/mfa/setup',{});
         console.log('\nEscanea este otpauth_url en Google Authenticator/1Password:\n', j.otpauth_url);
         console.log('\nSecreto base32:', j.base32);
         await pressEnter();
-      }
-      else if (op === '8') {
+      } else if (op === '4') {
         const code = await prompt('Código TOTP: ');
         const j = await api('POST','/auth/mfa/enable',{ code });
         console.log(j);
         await pressEnter();
+      } else if (op === '5') {
+        await doMfaDisableInteractive();
+        await pressEnter();
+      } else if (op === '6') {
+        await doPasswordForgotInteractive();
+        await pressEnter();
+      } else if (op === '7') {
+        await doPasswordResetInteractive();
+        await pressEnter();
+      } else if (op === '8') {
+        await doRegisterInteractiveSimple();
+        await pressEnter();
+      } else if (op === '0') {
+        return;
+      } else {
+        console.log('Opción no válida.');
+        await pressEnter();
       }
-      else if (op === '0') return;
     } catch (e) {
       console.error('❌', e.message);
       await pressEnter();
@@ -923,6 +984,9 @@ async function reportesMenu() {
 
 // ===================== MENÚ PRINCIPAL =====================
 async function mainMenu() {
+  // ⬅️ NUEVO: pide login si no hay sesión válida
+  await ensureLoggedInInteractive();
+
   while (true) {
     console.clear();
     const s = loadSession();
@@ -947,7 +1011,6 @@ async function mainMenu() {
     else if (op === '0') { console.log('👋'); process.exit(0); }
   }
 }
-
 // ===================== DAEMON (reemite QRs) =====================
 function seconds(n){ return Math.max(1, parseInt(n||'60',10)); }
 async function daemon() {
@@ -985,15 +1048,81 @@ async function daemon() {
   }
 }
 
+async function hasValidSession() {
+  try {
+    await api('GET', '/auth/me'); // usa el access_token actual; api() intentará refresh si hace falta
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseLockUntilFromError(eMsg) {
+  const m = String(eMsg || '').match(/"until":"([^"]+)"/);
+  return m ? new Date(m[1]) : null;
+}
+
+async function hasValidSession() {
+  try {
+    await api('GET', '/auth/me'); // usa access_token actual; api() ya intenta refresh si 401
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseLockUntilFromError(eMsg) {
+  const m = String(eMsg || '').match(/"until":"([^"]+)"/);
+  return m ? new Date(m[1]) : null;
+}
+
+async function ensureLoggedInInteractive() {
+  if (await hasValidSession()) return;
+
+  while (true) {
+    try {
+      await doLoginInteractive();
+      if (await hasValidSession()) return;
+      console.log('⚠️ Login realizado, pero /auth/me falló. Reintentando…');
+    } catch (e) {
+      const msg = String(e.message || '');
+      if (msg.includes('423 Locked')) {
+        const untilUtc = parseLockUntilFromError(msg);
+        if (untilUtc) {
+          const local = new Date(untilUtc.getTime() - 4*60*60*1000); // America/Santo_Domingo ≈ UTC-4
+          console.log(`🔒 Cuenta bloqueada hasta (UTC): ${untilUtc.toISOString()}`);
+          console.log(`🕓 Hora local aprox (America/Santo_Domingo): ${local.toISOString().replace('Z','')}`);
+        } else {
+          console.log('🔒 Cuenta bloqueada temporalmente.');
+        }
+        process.exit(1);
+      }
+      console.log(`❌ ${msg}`);
+    }
+    const retry = (await prompt('¿Reintentar login? (s/N): ')).trim().toLowerCase();
+    if (retry !== 's' && retry !== 'si' && retry !== 'sí') {
+      console.log('👋 Cancelado.');
+      process.exit(1);
+    }
+  }
+}
+
+
+
 // ===================== ENTRY =====================
 (async () => {
   const cmd = (process.argv[2] || 'menu').toLowerCase();
   try {
     if (cmd === 'login') {
+      // modo explícito (lo dejamos por conveniencia)
       await doLoginInteractive();
     } else if (cmd === 'daemon') {
+      // daemon necesita sesión: pedir login si no hay/expiró
+      await ensureLoggedInInteractive();
       await daemon();
     } else {
+      // por defecto: pedir login primero, luego mostrar menú
+      await ensureLoggedInInteractive();
       await mainMenu();
     }
   } catch (e) {
