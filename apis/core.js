@@ -76,6 +76,40 @@ function printTable(rows) {
 }
 function toBool(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true'; }
 
+function sanitizeText(v, max = 500) {
+  if (v == null) return undefined;
+  let s = String(v).trim();
+  s = s.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\r\n?/g, '\n');
+  if (s.length > max) s = s.slice(0, max);
+  return s || undefined;
+}
+function sanitizeISODate(v) {
+  const s = sanitizeText(v, 64);
+  return s || undefined;
+}
+function sanitizeDispBody(input) {
+  const out = {};
+  if (input && typeof input === 'object') {
+    if (input.codigo_receta != null) out.codigo_receta = sanitizeText(input.codigo_receta, 40);
+    if (input.fecha_escaneado != null) out.fecha_escaneado = sanitizeISODate(input.fecha_escaneado);
+    if (input.actividad_sospechosa !== undefined && input.actividad_sospechosa !== null) {
+      out.actividad_sospechosa = !!toBool(input.actividad_sospechosa);
+    }
+    if (input.comentario != null) out.comentario = sanitizeText(input.comentario, 500);
+  }
+  return out;
+}
+// 🔒 elimina claves sospechosas (por si quedaron del editor)
+function stripSuspiciousKeys(obj) {
+  const banned = [/^\s*tx\s*$/i, /onchain/i, /sql/i];
+  for (const k of Object.keys(obj)) {
+    if (banned.some(rx => rx.test(k))) delete obj[k];
+  }
+  return obj;
+}
+
+
+
 // ===================== helpers de entrada "bonitos" =====================
 async function askMode(label = 'cuerpo') {
   console.log(`\n¿Cómo quieres ingresar el ${label}?`);
@@ -728,15 +762,31 @@ async function recetasMenu() {
         console.log(r);
         await pressEnter();
       } else if (op === '4') {
-        const id = await prompt('Código receta (RX-...): ');
-        const tx = await prompt('onchain_tx_dispense (opcional): ');
-        const ph = await prompt('codigo_farmacia (opcional): ');
-        const r = await api('PUT', `/api/recetas/${encodeURIComponent(id)}/dispensar`, {
-          onchain_tx_dispense: tx || null,
-          qr_scanned_by_pharmacy_id: ph ? parseInt(ph,10) : null
-        });
-        console.log(r);
-        await pressEnter();
+  const id = await prompt('Código receta (RX-...): ');
+  let tx = await prompt('onchain_tx_dispense (opcional): ');
+  tx = (tx || '').replace(/\*/g, '').trim(); // por si la TTY mete asteriscos
+
+  const ph = await prompt('codigo_farmacia (opcional): ');
+  const codigo_farmacia = ph ? parseInt(ph, 10) : null;
+
+  // Enviamos ambos campos para máxima compatibilidad:
+  // - codigo_farmacia: nombre común usado en otras rutas
+  // - qr_scanned_by_pharmacy_id: nombre de columna en Receta (por si tu handler lo usa)
+  const body = {
+    onchain_tx_dispense: tx || null,
+    codigo_farmacia: codigo_farmacia,
+    qr_scanned_by_pharmacy_id: codigo_farmacia
+  };
+
+  try {
+    const r = await api('PUT', `/api/recetas/${encodeURIComponent(id)}/dispensar`, body);
+    console.log(r);
+  } catch (e) {
+    // Muestra más contexto para depurar el handler del backend
+    console.error('❌ Error al dispensar:', e.message);
+  }
+  await pressEnter();
+
       } else if (op === '5') {
         const id = await prompt('Código receta (RX-...): ');
         const e = await prompt('Nuevo estado (ISSUED|DISPENSED|REVOKED): ');
@@ -841,46 +891,56 @@ async function dispMenu() {
     console.log('0) Volver');
     const op = await prompt('\nOpción: ');
     try {
+      // 1) Registrar dispensación
+      // 
       if (op === '1') {
-        // Tabla Dispensacion: codigo_receta (req), fecha_escaneado (req, tiene default), actividad_sospechosa (req, default 0), comentario (opt)
-        const b = await askBody({
-          label: 'dispensación',
-          fields: [
-            { key: 'codigo_receta', label: 'Código receta (RX-...)', required: true },
-            { key: 'fecha_escaneado', label: 'Fecha ISO (YYYY-MM-DDTHH:mm:ssZ) (opcional si DB default)' },
-            { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
-            { key: 'comentario', label: 'Comentario' }
-          ],
-          template: {
-            codigo_receta: "RX-00001",
-            fecha_escaneado: "",
-            actividad_sospechosa: false,
-            comentario: "OK"
-          },
-          allowedKeys: ['codigo_receta','fecha_escaneado','actividad_sospechosa','comentario']
-        });
-        const r = await api('POST','/api/dispensacion', b);
-        console.log(r);
-        await pressEnter();
-      } else if (op === '2') {
-        const jti = await prompt('QR jti: ');
-        const b = await askBody({
-          label: 'dispensación por QR',
-          fields: [
-            { key: 'fecha_escaneado', label: 'Fecha ISO (YYYY-MM-DDTHH:mm:ssZ) (opcional si DB default)' },
-            { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
-            { key: 'comentario', label: 'Comentario' }
-          ],
-          template: {
-            fecha_escaneado: "",
-            actividad_sospechosa: false,
-            comentario: "OK"
-          },
-          allowedKeys: ['fecha_escaneado','actividad_sospechosa','comentario']
-        });
-        const r = await api('POST', `/api/dispensacion/qr/${encodeURIComponent(jti)}`, b);
-        console.log(r);
-        await pressEnter();
+  const b = await askBody({
+    label: 'dispensación',
+    fields: [
+      { key: 'codigo_receta', label: 'Código receta (RX-...)', required: true },
+      { key: 'fecha_escaneado', label: 'Fecha ISO (YYYY-MM-DD o YYYY-MM-DDTHH:mm:ssZ) (opcional, DB tiene default)' },
+      { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
+      { key: 'comentario', label: 'Comentario' }
+    ],
+    template: {
+      codigo_receta: "RX-00001",
+      fecha_escaneado: "",
+      actividad_sospechosa: false,
+      comentario: "OK"
+    },
+    allowedKeys: ['codigo_receta','fecha_escaneado','actividad_sospechosa','comentario']
+  });
+
+  const body = stripSuspiciousKeys(sanitizeDispBody(b));
+  // console.log('DEBUG body:', body); // si quieres ver qué se envía
+  const r = await api('POST','/api/dispensacion', body);
+  console.log(r);
+  await pressEnter();
+
+// 2) Registrar por QR jti
+} else if (op === '2') {
+  const jti = await prompt('QR jti: ');
+  const b = await askBody({
+    label: 'dispensación por QR',
+    fields: [
+      { key: 'fecha_escaneado', label: 'Fecha ISO (YYYY-MM-DD o YYYY-MM-DDTHH:mm:ssZ) (opcional, DB tiene default)' },
+      { key: 'actividad_sospechosa', label: '¿Sospechosa? (true/false)', parse: v => v===''?undefined:toBool(v) },
+      { key: 'comentario', label: 'Comentario' }
+    ],
+    template: {
+      fecha_escaneado: "",
+      actividad_sospechosa: false,
+      comentario: "OK"
+    },
+    allowedKeys: ['fecha_escaneado','actividad_sospechosa','comentario']
+  });
+
+  const body = stripSuspiciousKeys(sanitizeDispBody(b));
+  // console.log('DEBUG body:', body);
+  const r = await api('POST', `/api/dispensacion/qr/${encodeURIComponent(jti)}`, body);
+  console.log(r);
+  await pressEnter();
+
       } else if (op === '3') {
         // filtros soportados por columnas de Dispensacion
         const receta = await prompt('codigo_receta (opcional): ');

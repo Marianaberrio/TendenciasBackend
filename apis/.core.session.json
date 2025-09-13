@@ -1,5 +1,7 @@
 {
-  "access_token": null,
-  "refresh_token": null,
-  "me": null
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjUsInVzciI6ImFsaWNlIiwibWZhX2VuYWJsZWQiOmZhbHNlLCJtZmFfbWV0aG9kIjpudWxsLCJpYXQiOjE3NTc3MzQyOTcsImV4cCI6MTc1NzczNTE5N30.FInW4iPjb42i8bfJBKpjZExlc2ypwnKPlxyVQG3Xq6I",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOjUsImlhdCI6MTc1NzczNDI5NywiZXhwIjoxNzU5MDMwMjk3fQ.IxFTvACmWrvVwMnZyvSwAiZpqFZv2IF3YFA18fQuHUM",
+  "me": {
+    "nombre_usuario": "alice"
+  }
 }
